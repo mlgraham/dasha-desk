@@ -223,6 +223,12 @@ export async function createGateway({
   // empty means nobody, which is the safe default for a page that lists every user.
   adminEmails = process.env.OCM_ADMIN_EMAILS || '',
   modelAliases = process.env.OCM_MODEL_ALIASES ?? DEFAULT_MODEL_ALIASES,
+  // A tool pointed at us with only the two env vars sends its own model string
+  // ('gpt-4o', 'claude-...'), which we do not serve, and got a 503. That defeats
+  // "works unmodified", which is the distribution strategy. Unknown names now fall
+  // back to this, and the response says what actually served so the substitution is
+  // never silent. Set to '' to restore strict matching.
+  defaultModel = process.env.OCM_DEFAULT_MODEL ?? 'ocm-coder',
   databaseUrl = process.env.DATABASE_URL || '',
   consoleHost = process.env.OCM_CONSOLE_HOST || 'ocm.getdasha.com',
   apiHost = process.env.OCM_API_HOST || 'api.ocm.getdasha.com',
@@ -591,6 +597,15 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
     if (!model) return apiError(res, 400, 'model is required');
     if (!Array.isArray(messages) || !messages.length) return apiError(res, 400, 'messages must be a non-empty array');
 
+    // Resolve what will actually serve this request. Asking for something we have is
+    // unchanged; asking for something we do not falls back, and is disclosed below.
+    let served = model;
+    let substituted = false;
+    if (!registry.pick(model) && defaultModel && registry.pick(defaultModel)) {
+      served = defaultModel;
+      substituted = true;
+    }
+
     const promptTokens = countTokens(messages.map((m) => m?.content || '').join('\n'));
     const jobId = randomUUID();
     const created = Math.floor(Date.now() / 1000);
@@ -600,14 +615,19 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
     // Failover applies only before the first token: once bytes have shipped the
     // client has a partial answer and re-running would duplicate it (PDF §03).
     for (let attempt = 0; attempt < MAX_ROUTE_ATTEMPTS; attempt++) {
-      const host = registry.pick(model, tried);
+      const host = registry.pick(served, tried);
       if (!host) {
+        const available = registry.models();
         return apiError(res, 503, tried.size
-          ? `no healthy host for model ${model} after ${tried.size} attempt(s)`
-          : `no host currently serving model ${model}`, 'service_unavailable');
+          ? `no healthy host for model ${served} after ${tried.size} attempt(s)`
+          : `no host currently serving model ${model}. Available: ${available.join(', ') || 'none'}`,
+          'service_unavailable');
       }
       tried.add(host.id);
-      const outcome = await runJob({ host, jobId, model, messages, stream, res, chatId, created, consumer, promptTokens });
+      // The response carries the model that served, never an echo of the request.
+      // Silent substitution is the fastest way to become untrustworthy.
+      if (substituted && !res.headersSent) res.setHeader('x-ocm-served-model', served);
+      const outcome = await runJob({ host, jobId, model: served, messages, stream, res, chatId, created, consumer, promptTokens });
       if (outcome.ok || outcome.committed) return;
       // else: nothing was delivered to the client — safe to try another host
     }

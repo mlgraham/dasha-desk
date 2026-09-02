@@ -258,7 +258,11 @@ ${redeemBlock}
 <h2>Using the API</h2>
 <pre>export OPENAI_BASE_URL="https://${esc(apiHost)}/v1"
 export OPENAI_API_KEY="ocm_live_…"</pre>
-<p class="muted">Anything that speaks the OpenAI API works unmodified — no SDK of ours to install.</p>`);
+<p class="muted">Anything that speaks the OpenAI API works unmodified — no SDK of ours to install.
+If your tool asks for a model we do not serve, such as <code>gpt-4o</code>, the request is
+served by the network default rather than refused. The response tells you what actually
+ran, in the <code>model</code> field and an <code>x-ocm-served-model</code> header, so a
+substitution is never silent.</p>`);
 }
 
 /** Admin-only: the whole network, with account emails. Never rendered to a non-admin. */

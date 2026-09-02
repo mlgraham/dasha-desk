@@ -723,6 +723,43 @@ test('a signed-in account cannot revoke a credential it does not own', async () 
   } finally { await gw.close(); }
 });
 
+test('an unknown model falls back to the default and the response says so', async () => {
+  const gw = await startGateway({ defaultModel: 'qwen3-8b' });
+  try {
+    await connectHost(gw, { id: 'fallback-host', behaviour: echoHost });
+
+    // What an unmodified OpenAI client actually sends.
+    const res = await post(gw, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200, 'an unmodified client must not get a 503');
+
+    // The disclosure is the whole basis for doing this at all.
+    assert.equal(res.headers.get('x-ocm-served-model'), 'qwen3-8b',
+      'the header must name what actually served');
+    const body = await res.json();
+    assert.equal(body.model, 'qwen3-8b',
+      'the response model must be what served, never an echo of the request');
+
+    // A model we DO serve is untouched, and gets no substitution header.
+    const direct = await post(gw, ask());
+    assert.equal(direct.status, 200);
+    assert.equal(direct.headers.get('x-ocm-served-model'), null,
+      'no substitution means no header');
+    assert.equal((await direct.json()).model, 'qwen3-8b');
+  } finally { await gw.close(); }
+});
+
+test('with no default configured, an unknown model is refused with what is available', async () => {
+  const gw = await startGateway({ defaultModel: '' });
+  try {
+    await connectHost(gw, { id: 'strict-host', behaviour: echoHost });
+    const res = await post(gw, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 503);
+    const msg = (await res.json()).error.message;
+    assert.match(msg, /gpt-4o/, 'the error names what was asked for');
+    assert.match(msg, /Available: qwen3-8b/, 'and what could be asked for instead');
+  } finally { await gw.close(); }
+});
+
 test('a host reports whether it is warm, so loading is not mistaken for broken', async () => {
   const gw = await startGateway();
   try {
