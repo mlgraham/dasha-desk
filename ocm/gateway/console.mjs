@@ -195,10 +195,16 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const credRows = creds.length ? creds.map((c) => `<tr>
     <td>${c.kind === 'developer_key' ? 'Developer key' : 'Provider token'}</td>
     <td>${esc(c.label || '—')}</td>
+    <td>${c.kind === 'provider_token'
+      ? (c.bound_agent_id ? `<code>${esc(c.bound_agent_id)}</code>` : '<span class="muted">unclaimed</span>')
+      : '<span class="muted">—</span>'}</td>
     <td>${new Date(c.created_at).toISOString().slice(0, 10)}</td>
     <td>${c.last_used_at ? new Date(c.last_used_at).toISOString().slice(0, 10) : 'never'}</td>
     <td>${c.revoked_at ? '<span class="muted">revoked</span>'
-      : `<form method="post" action="/keys/revoke"><input type="hidden" name="credential_id" value="${esc(c.id)}">
+      : `${c.kind === 'provider_token' && c.bound_agent_id
+          ? `<form method="post" action="/keys/rebind" style="display:inline"><input type="hidden" name="credential_id" value="${esc(c.id)}">
+             <button class="ghost" style="margin:0;padding:5px 10px">Release</button></form> `
+          : ''}<form method="post" action="/keys/revoke" style="display:inline"><input type="hidden" name="credential_id" value="${esc(c.id)}">
          <button class="ghost" style="margin:0;padding:5px 10px">Revoke</button></form>`}</td>
   </tr>`).join('') : '';
 
@@ -240,8 +246,11 @@ ${redeemBlock}
 
 <h2>Credentials</h2>
 <div class="tablewrap">${credRows ? `<table class="data">
-<thead><tr><th>Kind</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+<thead><tr><th>Kind</th><th>Label</th><th>Machine</th><th>Created</th><th>Last used</th><th></th></tr></thead>
 <tbody>${credRows}</tbody></table>` : '<div class="empty">No credentials yet.</div>'}</div>
+${creds.some((c) => c.kind === 'provider_token') ? `<p class="muted" style="margin-top:8px">A provider
+token claims the first machine that uses it and will not work from another one.
+<strong>Release</strong> frees it for a different machine, for instance after a rebuild.</p>` : ''}
 <div class="row" style="margin-top:12px">
   <form class="card" method="post" action="/keys/new">
     <input type="hidden" name="kind" value="developer_key">

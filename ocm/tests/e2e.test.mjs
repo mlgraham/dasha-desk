@@ -52,12 +52,16 @@ function ready(gw) {
  * A stub host. `behaviour(job, api)` decides what this host does with a job,
  * which is how failure modes are exercised deterministically.
  */
-function connectHost(gw, { id, models = ['qwen3-8b'], behaviour }) {
+async function connectHost(gw, { id, models = ['qwen3-8b'], behaviour }) {
+  // One token per machine, because a provider token now binds to the first machine
+  // that presents it. Sharing one across stub hosts is exactly what the binding is
+  // designed to refuse, so the harness has to mirror how real providers are issued.
+  const cred = await gw.accounts.issue(gw.hostAccountId, 'provider_token', `stub ${id}`);
   return new Promise((resolve, reject) => {
     // Header, not a query string: the production agent does the same, so a token
     // cannot reach a proxy access log.
     const ws = new WebSocket(`${gw.wsBase}/host/connect`,
-      { headers: { authorization: `Bearer ${gw.hostToken}` } });
+      { headers: { authorization: `Bearer ${cred.secret}` } });
     ws.addEventListener('error', reject);
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({
@@ -720,6 +724,47 @@ test('a signed-in account cannot revoke a credential it does not own', async () 
     const after = (await gw.accounts.listCredentials(bAcct))[0];
     assert.equal(after.revoked_at, null, "one account revoked another account's credential");
     assert.ok(await gw.accounts.resolve(bSecret, 'developer_key'), "the victim's key must still work");
+  } finally { await gw.close(); }
+});
+
+test('a provider token binds to the first machine and refuses a second', async () => {
+  const gw = await startGatewayWithAdmin();
+  try {
+    const acct = await (await admin(gw, '/admin/accounts', { email: 'bind@r.o' })).json();
+    const tok = await (await admin(gw, '/admin/credentials',
+      { account_id: acct.id, kind: 'provider_token', label: 'the-mac' })).json();
+
+    const connect = (id) => new Promise((resolve) => {
+      const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+        { headers: { authorization: `Bearer ${tok.secret}` } });
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      ws.addEventListener('error', () => done({ ok: false }));
+      ws.addEventListener('close', () => done({ ok: false }));
+      ws.addEventListener('open', () => ws.send(JSON.stringify({
+        t: 'hello', agent: { id, models: ['qwen3-8b'], chip: 'stub', memory_gb: 24 } })));
+      ws.addEventListener('message', (ev) => {
+        const m = JSON.parse(ev.data);
+        if (m.t === 'welcome') done({ ok: true, ws });
+        if (m.t === 'error') done({ ok: false, message: m.message });
+      });
+    });
+
+    const first = await connect('machine-one');
+    assert.equal(first.ok, true, 'the first machine claims the token');
+
+    // A different machine presenting the same token must be turned away, and told why.
+    const second = await connect('machine-two');
+    assert.equal(second.ok, false, 'a second machine must not be able to use it');
+    assert.match(second.message || '', /bound to machine-one/,
+      'the refusal must name the machine holding it, and how to fix it');
+    assert.match(second.message || '', /console/i);
+
+    // Releasing it lets a different machine claim it, so a rebuild is not a lockout.
+    assert.equal(await gw.accounts.rebind(tok.id, acct.id), true);
+    const third = await connect('machine-two');
+    assert.equal(third.ok, true, 'after release, another machine may claim it');
+    first.ws?.close(); third.ws?.close();
   } finally { await gw.close(); }
 });
 

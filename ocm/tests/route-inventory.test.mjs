@@ -66,6 +66,8 @@ const ROUTES = [
     why: 'mints a credential' },
   { method: 'POST', path: '/console/keys/revoke', auth: 'session', unauth: 302,
     why: 'destroys a credential' },
+  { method: 'POST', path: '/console/keys/rebind', auth: 'session', unauth: 302,
+    why: 'frees a provider token from its machine; scoped to the signed-in account' },
   { method: 'POST', path: '/admin/accounts', auth: 'admin_token', unauth: 401,
     why: 'creates funded accounts' },
   { method: 'POST', path: '/admin/credentials', auth: 'admin_token', unauth: 401,

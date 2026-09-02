@@ -447,6 +447,16 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           }));
         }
 
+        if (req.method === 'POST' && consolePath === '/keys/rebind') {
+          if (!account) return redirect(res, '/');
+          const f = parseForm(await readBody(req));
+          // Scoped to the signed-in account, so one person cannot free another's token.
+          const ok = await accounts.rebind(f.credential_id, account.id);
+          return redirect(res, '/?notice=' + encodeURIComponent(ok
+            ? 'Token released. The next machine to present it will claim it.'
+            : 'That credential could not be released.'));
+        }
+
         if (req.method === 'POST' && consolePath === '/keys/revoke') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
@@ -798,9 +808,27 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
       if (msg.t === 'hello') {
-        hostId = msg.agent?.id || randomUUID();
-        registry.add(hostId, conn, { ...(msg.agent || {}), accountId });
-        conn.sendJson({ t: 'welcome', host_id: hostId, heartbeat_ms: HEARTBEAT_MS });
+        const claimed = msg.agent?.id || randomUUID();
+        // A provider token binds to the first machine that presents it. Before this,
+        // any token worked from any machine under any name, two machines could share
+        // one undetected, and revoking "the token for that Mac" was convention only.
+        // The agent id only arrives with hello, so this cannot happen at the upgrade.
+        Promise.resolve(owner ? accounts.claimAgent(owner.credentialId, claimed) : { ok: true })
+          .then((claim) => {
+            if (!claim.ok) {
+              console.error(JSON.stringify({ level: 'warn', msg: 'provider socket refused: token bound elsewhere',
+                presented_as: claimed, bound_to: claim.boundTo }));
+              conn.sendJson({ t: 'error', message:
+                `this provider token is bound to ${claim.boundTo}. Rebind it in the console ` +
+                `under Credentials, or issue a token for this machine.` });
+              conn.close(1008, 'token bound to another machine');
+              return;
+            }
+            hostId = claimed;
+            registry.add(hostId, conn, { ...(msg.agent || {}), accountId });
+            conn.sendJson({ t: 'welcome', host_id: hostId, heartbeat_ms: HEARTBEAT_MS });
+          })
+          .catch((e) => { console.error('claimAgent', e); conn.close(1011, 'internal'); });
         return;
       }
       const host = hostId && registry.get(hostId);
