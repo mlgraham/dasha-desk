@@ -271,7 +271,9 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
 
   const hostRows = s.hosts.map((h) => `<tr>
     <td><span class="dot ${h.inflight ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
-    <td>${who(h.accountId)}</td><td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
+    <td>${who(h.accountId)}</td>
+    <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Warming'}</td>
+    <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
     <td>${esc(h.models.join(', ') || '—')}</td><td>${h.inflight}</td>
     <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td></tr>`).join('');
 
@@ -302,7 +304,7 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
 
 <h2>Providers</h2>
 <div class="tablewrap">${hostRows ? `<table class="data">
-<thead><tr><th>Host</th><th>Owner</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th></tr></thead>
+<thead><tr><th>Host</th><th>Owner</th><th>State</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected.</div>'}</div>
 
 <h2>Accounts</h2>

@@ -723,6 +723,23 @@ test('a signed-in account cannot revoke a credential it does not own', async () 
   } finally { await gw.close(); }
 });
 
+test('a host reports whether it is warm, so loading is not mistaken for broken', async () => {
+  const gw = await startGateway();
+  try {
+    await connectHost(gw, { id: 'warm-probe', behaviour: echoHost });
+    // Freshly connected: no tokens produced yet, so not warm.
+    let net = await (await fetch(`${gw.base}/v1/network`)).json();
+    assert.equal(net.hosts[0].warm, false, 'a host that has served nothing is not warm');
+
+    await (await post(gw, ask())).json();
+    net = await (await fetch(`${gw.base}/v1/network`)).json();
+    assert.equal(net.hosts[0].warm, true, 'producing tokens marks the host warm');
+
+    // The public view must still carry no account identity.
+    assert.ok(!('accountId' in net.hosts[0]), '/v1/network must not expose ownership');
+  } finally { await gw.close(); }
+});
+
 test('the provider guide is public and warns about plaintext prompts', async () => {
   const gw = await startConsole();
   try {

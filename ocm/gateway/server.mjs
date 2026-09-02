@@ -543,6 +543,9 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           hosts: registry.online().map((h) => ({
             id: h.id, chip: h.caps.chip, memory_gb: h.caps.memory_gb,
             region: h.caps.region, models: [...h.models],
+            // Public, and carries no account identity: whether this host will answer
+            // in about a second or has to load a model first.
+            warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
             inflight: h.inflight.size, uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
           })),
           models: registry.models(),
