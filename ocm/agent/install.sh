@@ -41,6 +41,8 @@
 #   OCM_UV_BIN="/opt/homebrew/bin/uv"  explicit uv path when sudo has a narrow PATH.
 #   OCM_RUN_USER="alice"    account that runs inference. Defaults to SUDO_USER and
 #                           may never be root.
+#   OCM_REGION="us-west-2"  what the machine reports as its region. A reinstall keeps
+#                           the value already in /etc/ocm/agent.env; unset means "local".
 set -eu
 
 # Root must not inherit a caller-controlled PATH while downloading or installing
@@ -164,6 +166,14 @@ matches "$MODEL_MAP" '^[-A-Za-z0-9._/:@=,+]+$' 2048 \
   || die "OCM_MODEL_MAP contains unsupported characters or is too long"
 matches "$RUN_USER" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_RUN_USER contains unsupported characters"
+# A reinstall or update must not silently drop the region a machine already reports.
+# Explicit OCM_REGION wins; otherwise keep what the existing env file says; otherwise
+# leave it unset and the agent reports "local".
+REGION="${OCM_REGION:-$(sed -n 's|^OCM_REGION=||p' /etc/ocm/agent.env 2>/dev/null | head -1)}"
+if [ -n "$REGION" ]; then
+  matches "$REGION" '^[-A-Za-z0-9._]{1,32}$' \
+    || die "OCM_REGION contains unsupported characters"
+fi
 id "$RUN_USER" >/dev/null 2>&1 || die "OCM_RUN_USER does not name a local account"
 RUN_HOME=$(dscl . -read "/Users/$RUN_USER" NFSHomeDirectory 2>/dev/null \
   | awk '{ print $2; exit }')
@@ -248,6 +258,7 @@ OCM_GATEWAY_URL=$GATEWAY
 OCM_AGENT_ID=$AGENT_ID
 OCM_MODEL_MAP=$MODEL_MAP
 ENV
+[ -z "$REGION" ] || printf 'OCM_REGION=%s\n' "$REGION" >> /etc/ocm/agent.env
 chown "$RUN_USER" /etc/ocm/agent.env
 chmod 600 /etc/ocm/agent.env
 

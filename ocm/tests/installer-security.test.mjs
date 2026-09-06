@@ -291,3 +291,15 @@ test('the rotation helper accepts an enrollment code and exchanges it the same w
   const check = spawnSync('sh', ['-n'], { input: helper, encoding: 'utf8' });
   assert.equal(check.status, 0, check.stderr);
 });
+
+test('a reinstall keeps the region the machine already reports', () => {
+  // The M4 reported us-west-2 from a hand-added OCM_REGION line; the first enrollment
+  // reinstall rewrote agent.env without it and the host silently became "local".
+  assert.match(source, /REGION="\$\{OCM_REGION:-\$\(sed -n 's\|\^OCM_REGION=\|\|p' \/etc\/ocm\/agent\.env 2>\/dev\/null \| head -1\)\}"/,
+    'explicit OCM_REGION wins, then the existing env file, then unset');
+  assert.match(source, /matches "\$REGION" '\^\[-A-Za-z0-9\._\]\{1,32\}\$'/, 'the region is allowlisted before it is written to a sourced file');
+  const write = source.indexOf("printf 'OCM_REGION=%s\\n' \"$REGION\" >> /etc/ocm/agent.env");
+  const env = source.indexOf('cat > /etc/ocm/agent.env <<ENV');
+  const chown = source.indexOf('chown "$RUN_USER" /etc/ocm/agent.env');
+  assert.ok(env > 0 && write > env && write < chown, 'the region line is appended right after the env file is written, before ownership is set');
+});
