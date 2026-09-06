@@ -4,6 +4,8 @@
  * Two credential kinds, both account-bound and revocable:
  *   - developer keys  (`ocm_live_…`) authorise /v1/* requests
  *   - provider tokens (`ocm_host_…`) authorise a host socket
+ * plus enrollment codes (`ocm_enroll_…`): single-use, minutes-lived, exchanged by the
+ * installer for a provider token already bound to the machine.
  *
  * Only the SHA-256 hash is stored. The plaintext is returned exactly once, at
  * creation, and cannot be recovered afterwards — losing one means issuing another.
@@ -18,6 +20,11 @@ export const hashSecret = (s) => createHash('sha256').update(s, 'utf8').digest('
 const mint = (prefix) => `${prefix}_${randomBytes(24).toString('base64url')}`;
 export const mintDeveloperKey = () => mint('ocm_live');
 export const mintProviderToken = () => mint('ocm_host');
+// Short-lived, single-use, exchanged by the installer for a provider token that is
+// already bound to the machine. Low value if it leaks: it expires in minutes and
+// works once, which is the whole point of handing people this instead of a token.
+export const mintEnrollmentCode = () => mint('ocm_enroll');
+export const ENROLLMENT_TTL_MS = 15 * 60 * 1000;
 
 /**
  * Email is a label and future notification route, not an authenticator. Until OCM
@@ -71,6 +78,22 @@ CREATE INDEX IF NOT EXISTS credentials_account_idx ON credentials (account_id);
 -- cannot be used from somewhere else and per-machine revocation means what an
 -- operator assumes it means. Added later, hence the ALTER for existing databases.
 ALTER TABLE credentials ADD COLUMN IF NOT EXISTS bound_agent_id text;
+
+-- Enrollment codes: what a person pastes instead of a provider token. Stored hashed
+-- like every other secret; used once; expire. The credential a code produced is
+-- recorded so the console can show what came of it.
+CREATE TABLE IF NOT EXISTS enrollment_codes (
+  id            text PRIMARY KEY,
+  account_id    text NOT NULL REFERENCES accounts(id),
+  hash          text NOT NULL UNIQUE,
+  label         text,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz NOT NULL,
+  used_at       timestamptz,
+  agent_id      text,
+  credential_id text
+);
+CREATE INDEX IF NOT EXISTS enrollment_codes_account_idx ON enrollment_codes (account_id);
 `;
 
 /**
@@ -97,14 +120,77 @@ export class PgAccounts {
     return inserted.rows[0];
   }
 
-  async issue(accountId, kind, label = null) {
+  async issue(accountId, kind, label = null, { boundAgentId = null } = {}) {
     const secret = kind === 'developer_key' ? mintDeveloperKey() : mintProviderToken();
     const id = `cred_${randomBytes(9).toString('base64url')}`;
     await this.pool.query(
-      `INSERT INTO credentials (id, account_id, kind, hash, label) VALUES ($1,$2,$3,$4,$5)`,
-      [id, accountId, kind, hashSecret(secret), label]);
+      `INSERT INTO credentials (id, account_id, kind, hash, label, bound_agent_id) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, accountId, kind, hashSecret(secret), label, boundAgentId]);
     // The only time the plaintext exists outside the caller's hands.
     return { id, secret, kind, label };
+  }
+
+  /** Mint a single-use enrollment code for this account. Plaintext returned once. */
+  async issueEnrollment(accountId, label = null, ttlMs = ENROLLMENT_TTL_MS) {
+    const code = mintEnrollmentCode();
+    const id = `enr_${randomBytes(9).toString('base64url')}`;
+    const expiresAt = new Date(Date.now() + ttlMs);
+    await this.pool.query(
+      `INSERT INTO enrollment_codes (id, account_id, hash, label, expires_at) VALUES ($1,$2,$3,$4,$5)`,
+      [id, accountId, hashSecret(code), label, expiresAt]);
+    return { id, code, label, expires_at: expiresAt };
+  }
+
+  /**
+   * Exchange a code for a provider token bound to `agentId`. One transaction: the
+   * code is consumed conditionally (unused, unexpired) so two racing redemptions
+   * cannot both win; the new token is minted already bound; and any other live
+   * provider token on the same account bound to the same machine is revoked, so
+   * re-enrolling a machine is how it rotates. Returns null for unknown, used and
+   * expired alike — the caller must not distinguish them.
+   */
+  async redeemEnrollment(code, agentId, label = null) {
+    if (!code || !agentId) return null;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const used = await client.query(
+        `UPDATE enrollment_codes SET used_at = now(), agent_id = $2
+          WHERE hash = $1 AND used_at IS NULL AND expires_at > now()
+        RETURNING id, account_id, label`, [hashSecret(code), agentId]);
+      if (!used.rows[0]) { await client.query('ROLLBACK'); return null; }
+      const enr = used.rows[0];
+      const secret = mintProviderToken();
+      const credId = `cred_${randomBytes(9).toString('base64url')}`;
+      const finalLabel = label || enr.label || agentId;
+      await client.query(
+        `INSERT INTO credentials (id, account_id, kind, hash, label, bound_agent_id)
+         VALUES ($1,$2,'provider_token',$3,$4,$5)`,
+        [credId, enr.account_id, hashSecret(secret), finalLabel, agentId]);
+      const rotated = await client.query(
+        `UPDATE credentials SET revoked_at = now()
+          WHERE account_id = $1 AND kind = 'provider_token' AND bound_agent_id = $2
+            AND revoked_at IS NULL AND id <> $3
+        RETURNING id`, [enr.account_id, agentId, credId]);
+      await client.query(`UPDATE enrollment_codes SET credential_id = $2 WHERE id = $1`, [enr.id, credId]);
+      await client.query('COMMIT');
+      return { credentialId: credId, secret, accountId: enr.account_id, label: finalLabel,
+               rotated: rotated.rows.map((r) => r.id) };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Codes not yet used and not yet expired, for the dashboard. Never the code itself. */
+  async listEnrollments(accountId) {
+    const { rows } = await this.pool.query(
+      `SELECT id, label, created_at, expires_at FROM enrollment_codes
+        WHERE account_id = $1 AND used_at IS NULL AND expires_at > now()
+        ORDER BY created_at DESC`, [accountId]);
+    return rows;
   }
 
   async resolve(secret, kind) {
@@ -207,7 +293,7 @@ export class PgAccounts {
 
 /** In-memory equivalent, so the test suite needs no database. */
 export class MemoryAccounts {
-  constructor() { this.accounts = new Map(); this.creds = new Map(); }
+  constructor() { this.accounts = new Map(); this.creds = new Map(); this.enrollments = new Map(); }
   async init() { return this; }
 
   async createAccount(email) {
@@ -224,12 +310,50 @@ export class MemoryAccounts {
     return account;
   }
 
-  async issue(accountId, kind, label = null) {
+  async issue(accountId, kind, label = null, { boundAgentId = null } = {}) {
     const secret = kind === 'developer_key' ? mintDeveloperKey() : mintProviderToken();
     const id = `cred_${randomBytes(9).toString('base64url')}`;
     this.creds.set(id, { id, account_id: accountId, kind, hash: hashSecret(secret),
-                         label, created_at: new Date(), last_used_at: null, revoked_at: null });
+                         label, created_at: new Date(), last_used_at: null, revoked_at: null,
+                         bound_agent_id: boundAgentId });
     return { id, secret, kind, label };
+  }
+
+  async issueEnrollment(accountId, label = null, ttlMs = ENROLLMENT_TTL_MS) {
+    const code = mintEnrollmentCode();
+    const id = `enr_${randomBytes(9).toString('base64url')}`;
+    const expires_at = new Date(Date.now() + ttlMs);
+    this.enrollments.set(id, { id, account_id: accountId, hash: hashSecret(code), label,
+                               created_at: new Date(), expires_at, used_at: null,
+                               agent_id: null, credential_id: null });
+    return { id, code, label, expires_at };
+  }
+
+  async redeemEnrollment(code, agentId, label = null) {
+    if (!code || !agentId) return null;
+    const h = hashSecret(code);
+    let enr = null;
+    for (const e of this.enrollments.values()) {
+      if (sameSecret(e.hash, h)) { enr = e; break; }
+    }
+    if (!enr || enr.used_at || enr.expires_at <= new Date()) return null;
+    enr.used_at = new Date(); enr.agent_id = agentId;
+    const finalLabel = label || enr.label || agentId;
+    const cred = await this.issue(enr.account_id, 'provider_token', finalLabel, { boundAgentId: agentId });
+    const rotated = [];
+    for (const c of this.creds.values()) {
+      if (c.account_id === enr.account_id && c.kind === 'provider_token' && c.bound_agent_id === agentId
+          && !c.revoked_at && c.id !== cred.id) { c.revoked_at = new Date(); rotated.push(c.id); }
+    }
+    enr.credential_id = cred.id;
+    return { credentialId: cred.id, secret: cred.secret, accountId: enr.account_id, label: finalLabel, rotated };
+  }
+
+  async listEnrollments(accountId) {
+    const now = new Date();
+    return [...this.enrollments.values()]
+      .filter((e) => e.account_id === accountId && !e.used_at && e.expires_at > now)
+      .map(({ id, label, created_at, expires_at }) => ({ id, label, created_at, expires_at }));
   }
 
   async resolve(secret, kind) {

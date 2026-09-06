@@ -234,3 +234,60 @@ test('the update helper reinstalls from what is on disk and never exposes the to
   assert.match(guide, /sudo \/opt\/ocm\/bin\/ocm-agent-update/);
   assert.match(guide, /--check/);
 });
+
+test('an enrollment code is exchanged for a bound token, in a body, before anything is written', () => {
+  const agentCheck = source.indexOf(`matches "$AGENT_ID" '^[-A-Za-z0-9._]{1,64}$'`);
+  const exchange = source.indexOf(`if matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then`);
+  const tokenCheck = source.indexOf(`matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$'`);
+  const verify = source.indexOf('"$SOURCE/v1/provider/verify"');
+  assert.ok(agentCheck > 0 && exchange > agentCheck,
+    'the agent id goes into the enrollment body, so it must be validated first');
+  assert.ok(tokenCheck > exchange && verify > tokenCheck,
+    'exchange -> token-shape check -> verify must be the order');
+  const block = source.slice(exchange, tokenCheck);
+  // The code and the token are secrets: JSON body over HTTPS through curl_https,
+  // never a query string, never argv of anything but curl, never printed.
+  assert.match(block, /curl_https --fail -H 'content-type: application\/json'/);
+  assert.match(block, /--data "\{\\"code\\":\\"\$OCM_HOST_TOKEN\\",\\"agent_id\\":\\"\$AGENT_ID\\"\}"/);
+  assert.match(block, /"\$SOURCE\/v1\/provider\/enroll"/);
+  assert.doesNotMatch(source, /enroll\?/);
+  assert.doesNotMatch(source, /[?&]code=/);
+  assert.match(block, /sed -n 's\/\.\*"token":"\\\(ocm_host_\[-A-Za-z0-9_\]\*\\\)"\.\*\/\\1\/p'/,
+    'the returned token is parsed with a shape-restricted pattern');
+  assert.match(block, /\n  export OCM_HOST_TOKEN\n/, 'the exchanged token must be exported for the doctor');
+  assert.match(block, /nothing was installed/);
+  assert.match(block, /enrolled as %s/);
+  assert.match(block, /rotated %s older token/);
+  for (const line of block.split('\n')) {
+    if (/^\s*#/.test(line)) continue;
+    assert.doesNotMatch(line, /printf[^\n]*\$(?:\{)?(?:OCM_HOST_TOKEN|ENROLL)\b(?![^\n]*\| sed -n)/,
+      `exchange must not print the code, the token or the raw response: ${line}`);
+  }
+  // Prompt and header document the code path; the token path stays.
+  assert.match(source, /Provider token or enrollment code \(input is hidden\): /);
+  assert.match(source, /get an enrollment code from the console/);
+  assert.match(source, /sudo OCM_AGENT_ID="my-mac" sh install\.sh/);
+  assert.match(source, /A provider token works everywhere a code does/);
+  assert.match(source, /or an ocm_enroll_ code/);
+});
+
+test('the rotation helper accepts an enrollment code and exchanges it the same way', () => {
+  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-token\" <<'TOK'");
+  const end = source.indexOf('\nTOK\n', start);
+  assert.ok(start > 0 && end > start);
+  const helper = source.slice(source.indexOf('\n', start) + 1, end + 1);
+  const exchange = helper.indexOf("grep -Eq '^ocm_enroll_[-A-Za-z0-9_]{16,}$'");
+  const shape = helper.indexOf("grep -Eq '^ocm_host_[-A-Za-z0-9_]{16,}$'");
+  const verify = helper.indexOf('"$BASE/v1/provider/verify"');
+  assert.ok(exchange > 0 && shape > exchange && verify > shape,
+    'code exchange -> token-shape check -> verify, so a bad exchange never reaches the env file');
+  assert.match(helper, /AGENT_ID=\$\(sed -n 's\|\^OCM_AGENT_ID=\|\|p' \/etc\/ocm\/agent\.env\)/,
+    'the helper enrolls under the id already recorded on this machine');
+  assert.match(helper, /--data "\{\\"code\\":\\"\$NEW_TOKEN\\",\\"agent_id\\":\\"\$AGENT_ID\\"\}"/);
+  assert.match(helper, /"\$BASE\/v1\/provider\/enroll"/);
+  assert.match(helper, /Provider token or enrollment code \(input is hidden\): /);
+  assert.match(helper, /do not pass the token on the command line/);
+  assert.match(helper, /expected an issued ocm_host_ provider token/);
+  const check = spawnSync('sh', ['-n'], { input: helper, encoding: 'utf8' });
+  assert.equal(check.status, 0, check.stderr);
+});

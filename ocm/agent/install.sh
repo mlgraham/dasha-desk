@@ -2,7 +2,7 @@
 # OCM provider installer for macOS (Apple Silicon).
 #
 # Read this before running it: piping an unread script into a shell is a bad habit.
-# It is about 450 lines. The two parts worth your attention are the token check at the
+# It is about 500 lines. The two parts worth your attention are the token check at the
 # top, which runs before anything is written, and the launchd handling at the end.
 #
 # What it does:
@@ -12,14 +12,22 @@
 #   4. stores your provider token in an owner-only environment file
 #   5. installs a launchd daemon that runs as the invoking non-root user
 #
-# Human path — prompt with echo off, then hand the variable to sudo. This keeps the
-# long-lived provider token out of argv and out of shell history:
+# Human path — get an enrollment code from the console (Enroll a machine), then:
+#   sudo OCM_AGENT_ID="my-mac" sh install.sh
+# It prompts for the code with echo off and exchanges it, over HTTPS, for a provider
+# token that is already bound to this machine. The code is single-use and expires in
+# minutes, so nothing long-lived is ever typed. Enrolling the same machine name again
+# rotates it: the old token is revoked once the new one exists.
+#
+# A provider token works everywhere a code does. To hand one over without putting it
+# on argv or in shell history, prompt with echo off and hand the variable to sudo:
 #   read -rsp "Provider token: " OCM_HOST_TOKEN
 #   printf '\n'
 #   sudo --preserve-env=OCM_HOST_TOKEN sh install.sh
 #
 # Running this script under sudo without OCM_HOST_TOKEN set also prompts, with
-# terminal echo disabled. Automation may use a secret file or stdin instead:
+# terminal echo disabled. Automation may use a secret file or stdin instead, holding
+# either a code or a token:
 #   sudo env OCM_HOST_TOKEN_FILE=/path/to/token sh install.sh
 #   sudo sh install.sh < /path/to/token
 #
@@ -88,7 +96,7 @@ if [ -z "${OCM_HOST_TOKEN:-}" ] && [ -n "${OCM_HOST_TOKEN_FILE:-}" ]; then
 fi
 if [ -z "${OCM_HOST_TOKEN:-}" ]; then
   if [ -t 0 ]; then
-    printf 'Provider token (input is hidden): ' >&2
+    printf 'Provider token or enrollment code (input is hidden): ' >&2
     if stty_state=$(stty -g 2>/dev/null); then
       stty -echo
       IFS= read -r OCM_HOST_TOKEN || true
@@ -117,10 +125,39 @@ matches "$GATEWAY" '^wss://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
   || die "OCM_GATEWAY_URL must be a bare wss:// host with an optional port"
 matches "$SOURCE" '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
   || die "the gateway could not be converted to a safe HTTPS source"
-matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$' \
-  || die "OCM_HOST_TOKEN must be an issued provider token beginning ocm_host_"
+# The agent id is validated before the enrollment exchange below, because it goes
+# into that request body.
 matches "$AGENT_ID" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_AGENT_ID may contain only letters, numbers, dot, underscore and hyphen (64 max)"
+
+# An enrollment code is exchanged for a provider token before anything else happens.
+# The code travels in a JSON body over HTTPS, never in a URL, a log line or argv; the
+# gateway mints a token already bound to this agent id and revokes any older token
+# bound to the same id on the same account, so re-enrolling is how a machine rotates.
+if matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
+  printf 'exchanging the enrollment code for a provider token …\n'
+  ENROLL=$(curl_https --fail -H 'content-type: application/json' \
+    --data "{\"code\":\"$OCM_HOST_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
+    "$SOURCE/v1/provider/enroll" 2>/dev/null) || {
+    REASON=$(curl_https -H 'content-type: application/json' \
+      --data "{\"code\":\"$OCM_HOST_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
+      "$SOURCE/v1/provider/enroll" 2>/dev/null \
+      | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+    die "${REASON:-could not reach $SOURCE to exchange the enrollment code}
+  nothing was installed"
+  }
+  OCM_HOST_TOKEN=$(printf '%s' "$ENROLL" | sed -n 's/.*"token":"\(ocm_host_[-A-Za-z0-9_]*\)".*/\1/p')
+  [ -n "$OCM_HOST_TOKEN" ] || die "the gateway did not return a provider token for that enrollment code
+  nothing was installed"
+  export OCM_HOST_TOKEN
+  ROTATED=$(printf '%s' "$ENROLL" | sed -n 's/.*"rotated":\([0-9]*\).*/\1/p')
+  printf '  enrolled as %s\n' "$AGENT_ID"
+  if [ -n "$ROTATED" ] && [ "$ROTATED" != 0 ]; then
+    printf '  (rotated %s older token(s) for this machine)\n' "$ROTATED"
+  fi
+fi
+matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$' \
+  || die "OCM_HOST_TOKEN must be an issued provider token beginning ocm_host_, or an ocm_enroll_ code"
 matches "$MLX_MODEL" '^[-A-Za-z0-9._/:@+]+$' 512 \
   || die "OCM_MLX_MODEL contains unsupported characters or is too long"
 matches "$MODEL_MAP" '^[-A-Za-z0-9._/:@=,+]+$' 2048 \
@@ -255,7 +292,7 @@ NEW_TOKEN=""
 if [ -n "${OCM_HOST_TOKEN_FILE:-}" ]; then
   IFS= read -r NEW_TOKEN < "$OCM_HOST_TOKEN_FILE" || true
 elif [ -t 0 ]; then
-  printf 'Provider token (input is hidden): ' >&2
+  printf 'Provider token or enrollment code (input is hidden): ' >&2
   if stty_state=$(stty -g 2>/dev/null); then
     stty -echo
     IFS= read -r NEW_TOKEN || true
@@ -267,8 +304,6 @@ elif [ -t 0 ]; then
 else
   IFS= read -r NEW_TOKEN || true
 fi
-printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_host_[-A-Za-z0-9_]{16,}$' \
-  || { echo "error: expected an issued ocm_host_ provider token" >&2; exit 1; }
 OWNER=$(stat -f '%Su' /etc/ocm/agent.env 2>/dev/null || true)
 printf '%s\n' "$OWNER" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
   || { echo "error: could not identify the provider account" >&2; exit 1; }
@@ -276,6 +311,32 @@ printf '%s\n' "$OWNER" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
 BASE=$(sed -n 's|^OCM_GATEWAY_URL=||p' /etc/ocm/agent.env | sed 's|^wss://|https://|')
 printf '%s\n' "$BASE" | LC_ALL=C grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
   || { echo "error: unsafe or missing gateway URL in /etc/ocm/agent.env" >&2; exit 1; }
+# An enrollment code from the console is exchanged for a token bound to this machine,
+# using the agent id already recorded here; the old token is revoked by the gateway.
+if printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
+  AGENT_ID=$(sed -n 's|^OCM_AGENT_ID=||p' /etc/ocm/agent.env)
+  printf '%s\n' "$AGENT_ID" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
+    || { echo "error: unsafe or missing OCM_AGENT_ID in /etc/ocm/agent.env" >&2; exit 1; }
+  printf 'exchanging the enrollment code ...\n'
+  ENROLL=$(curl --silent --show-error --location --fail \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    -H 'content-type: application/json' \
+    --data "{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
+    "$BASE/v1/provider/enroll" 2>/dev/null) || {
+    curl --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      -H 'content-type: application/json' \
+      --data "{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
+      "$BASE/v1/provider/enroll" 2>/dev/null \
+      | sed -n 's/.*"message":"\([^"]*\)".*/error: \1/p' >&2
+    echo "nothing was changed" >&2
+    exit 1
+  }
+  NEW_TOKEN=$(printf '%s' "$ENROLL" | sed -n 's/.*"token":"\(ocm_host_[-A-Za-z0-9_]*\)".*/\1/p')
+  printf 'enrolled as %s\n' "$AGENT_ID"
+fi
+printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_host_[-A-Za-z0-9_]{16,}$' \
+  || { echo "error: expected an issued ocm_host_ provider token" >&2; exit 1; }
 printf 'checking token ...\n'
 if ! curl --silent --show-error --location --fail \
   --proto '=https' --proto-redir '=https' --tlsv1.2 \

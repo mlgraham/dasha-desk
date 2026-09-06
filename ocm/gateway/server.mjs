@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderStatus } from './console.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderEnrollment, renderStatus } from './console.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
@@ -515,6 +515,17 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           }));
         }
 
+        if (req.method === 'POST' && consolePath === '/enroll') {
+          if (!account) return redirect(res, '/');
+          const f = parseForm(await readBody(req));
+          const label = (f.label || '').slice(0, 64) || null;
+          const enr = await accounts.issueEnrollment(account.id, label);
+          // Same slug rule as /keys/new: [a-z0-9-] only, so it cannot break out of quotes.
+          const agentId = (label || '').toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+          return html(res, 200, renderEnrollment({ code: enr.code, label, agentId,
+                                                   expiresAt: enr.expires_at, apiHost }));
+        }
         if (req.method === 'POST' && consolePath === '/keys/rebind') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
@@ -561,6 +572,14 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           }
           // The plaintext appears here and nowhere else, ever.
           return json(res, 200, await accounts.issue(body.account_id, body.kind, body.label || null));
+        }
+        if (req.method === 'POST' && url.pathname === '/admin/enroll') {
+          const body = JSON.parse(await readBody(req) || '{}');
+          if (!body.account_id) return apiError(res, 400, 'account_id is required');
+          const minutes = Number(body.ttl_minutes);
+          const ttl = minutes > 0 ? Math.min(minutes, 60) * 60 * 1000 : undefined;
+          // The code appears here and nowhere else.
+          return json(res, 200, await accounts.issueEnrollment(body.account_id, body.label || null, ttl));
         }
         if (req.method === 'POST' && url.pathname === '/admin/revoke') {
           const body = JSON.parse(await readBody(req) || '{}');
@@ -632,6 +651,11 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
             'that is a developer key, not a provider token. Provider tokens start with ocm_host_ and are issued from the console under New provider token.',
             'authentication_error');
         }
+        if (/^ocm_enroll_/.test(presented)) {
+          return apiError(res, 401,
+            'that is an enrollment code, not a provider token. The installer exchanges it for one: paste it at the installer prompt.',
+            'authentication_error');
+        }
         const found = await accounts.resolve(presented, 'provider_token');
         if (!found) {
           return apiError(res, 401,
@@ -640,6 +664,32 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
         }
         const acct = await accounts.accountFor(found.accountId);
         return json(res, 200, { ok: true, account_id: found.accountId, email: acct ? acct.email : null });
+      }
+      // Exchange a single-use enrollment code for a provider token bound to this
+      // machine. The code is the credential, so there is no auth header; unknown,
+      // used and expired are one answer on purpose (no oracle). The token appears in
+      // this response and nowhere else, ever.
+      if (req.method === 'POST' && url.pathname === '/v1/provider/enroll') {
+        let body;
+        try { body = JSON.parse(await readBody(req) || '{}'); }
+        catch { return apiError(res, 400, 'body must be JSON'); }
+        const code = typeof body.code === 'string' ? body.code : '';
+        const agentId = typeof body.agent_id === 'string' ? body.agent_id : '';
+        const label = typeof body.label === 'string' && body.label ? body.label.slice(0, 64) : null;
+        if (!/^ocm_enroll_[-A-Za-z0-9_]{16,}$/.test(code)) {
+          return apiError(res, 400, 'code must be an enrollment code beginning ocm_enroll_');
+        }
+        if (!/^[-A-Za-z0-9._]{1,64}$/.test(agentId)) {
+          return apiError(res, 400, 'agent_id may contain only letters, numbers, dot, underscore and hyphen (64 max)');
+        }
+        const issued = await accounts.redeemEnrollment(code, agentId, label);
+        if (!issued) {
+          return apiError(res, 401, 'enrollment code is not valid: unknown, already used, or expired', 'authentication_error');
+        }
+        console.error(JSON.stringify({ level: 'info', msg: 'provider enrolled',
+          accountId: issued.accountId, agentId, rotated: issued.rotated.length }));
+        return json(res, 200, { ok: true, token: issued.secret, agent_id: agentId,
+                                label: issued.label, rotated: issued.rotated.length });
       }
       if (req.method === 'GET' && url.pathname === '/v1/network') {
         return json(res, 200, {

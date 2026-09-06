@@ -159,6 +159,26 @@ ${whatNext || ''}
 <p><a href="/">Back to the console</a></p>`);
 }
 
+/** The enrollment code page. Shown once; the code expires in minutes and works once. */
+export function renderEnrollment({ code, label, agentId, expiresAt, apiHost }) {
+  const mins = Math.max(1, Math.round((new Date(expiresAt) - Date.now()) / 60000));
+  const id = agentId || 'a-stable-name';
+  return page('Enrollment code', `<h1>Enrollment code${label ? ` for ${esc(label)}` : ''}</h1>
+<div class="secret"><strong>Valid for ${mins} minutes and works once.</strong>
+<code>${esc(code)}</code></div>
+<p>On the Mac you are adding, in Terminal:</p>
+<pre>curl -fsSL https://${esc(apiHost)}/install.sh -o install.sh
+shasum -a 256 install.sh      # compare with https://${esc(apiHost)}/install.sh.sha256
+sudo OCM_AGENT_ID="${esc(id)}" sh install.sh</pre>
+<p>The installer asks for this code with typing hidden, exchanges it for a provider token
+that only this machine can use, and never shows you that token. If this machine was
+enrolled before under the same name, its previous token is revoked in the same step, so
+re-enrolling is how you rotate. Keep <code>OCM_AGENT_ID</code> the same every time.</p>
+<p class="muted">A code that expires unused is harmless; issue another. Automation that
+needs a long-lived credential can still use <strong>New provider token</strong>.</p>
+<p><a href="/">Back to the console</a></p>`);
+}
+
 export function renderLanding({ inviteRequired, error }) {
   return page('OCM console', `<h1>Open-Compute Marketplace</h1>
 <p class="sub">Alpha.</p>
@@ -193,6 +213,7 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const mine = s.consumers.find((c) => c.consumer === account.id)
     || { granted: 0, used: 0, balance: 0, requests: 0 };
   const creds = await accounts.listCredentials(account.id);
+  const pending = typeof accounts.listEnrollments === 'function' ? await accounts.listEnrollments(account.id) : [];
   const myHosts = s.hosts.filter((h) => h.accountId === account.id);
 
   const credRows = creds.length ? creds.map((c) => `<tr>
@@ -257,7 +278,14 @@ Act on a credential by its <strong>id</strong>: the buttons here do, and scripte
 ${creds.some((c) => c.kind === 'provider_token') ? `<p class="muted" style="margin-top:8px">A provider
 token claims the first machine that uses it and will not work from another one.
 <strong>Release</strong> frees it for a different machine, for instance after a rebuild.</p>` : ''}
+${pending.length ? `<p class="muted" style="margin-top:8px">${pending.length} enrollment code${pending.length === 1 ? '' : 's'} outstanding;
+the newest expires in ${Math.max(1, Math.round((new Date(pending[0].expires_at) - Date.now()) / 60000))} min. Unused codes expire harmlessly.</p>` : ''}
 <div class="row" style="margin-top:12px">
+  <form class="card" method="post" action="/enroll">
+    <h3>Enroll a Mac</h3><p class="muted">Get a one-time code, valid 15 minutes. The installer
+    exchanges it for a token only that machine can use; re-enrolling rotates it.</p>
+    <label for="l0">Machine name</label><input id="l0" type="text" name="label" placeholder="mac mini">
+    <button type="submit">Get enrollment code</button></form>
   <form class="card" method="post" action="/keys/new">
     <input type="hidden" name="kind" value="developer_key">
     <h3>New developer key</h3><p class="muted">For calling the API.</p>
@@ -265,8 +293,9 @@ token claims the first machine that uses it and will not work from another one.
     <button type="submit">Issue key</button></form>
   <form class="card" method="post" action="/keys/new">
     <input type="hidden" name="kind" value="provider_token">
-    <h3>New provider token</h3><p class="muted">For connecting a Mac.</p>
-    <label for="l2">Label</label><input id="l2" type="text" name="label" placeholder="mac mini">
+    <h3>New provider token</h3><p class="muted">For automation that needs a long-lived
+    credential. For a Mac you are setting up by hand, enroll it instead.</p>
+    <label for="l2">Label</label><input id="l2" type="text" name="label" placeholder="ci-runner">
     <button type="submit">Issue token</button></form>
 </div>
 
@@ -422,11 +451,15 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
 <h2>Install</h2>
 
 <div class="step">
-  <h3><span class="num">1</span>Issue a provider token</h3>
-  <p class="cap">On the <a href="/">console</a>, under <strong>New provider token</strong>. It is shown once.</p>
-  <div class="note warn"><strong>A developer key is not a provider token.</strong> Provider
-  tokens start <code>ocm_host_</code>; developer keys start <code>ocm_live_</code> and are
-  refused here. This is the most common reason a new provider never appears.</div>
+  <h3><span class="num">1</span>Get an enrollment code</h3>
+  <p class="cap">On the <a href="/">console</a>, under <strong>Enroll a Mac</strong>. Give the
+  machine a name; the code is shown once, is valid for 15 minutes, and works once. The
+  installer exchanges it for a provider token that only this machine can use, and you never
+  handle that token. Enrolling the same name again rotates it.</p>
+  <div class="note warn"><strong>A developer key is not a provider token, and not an enrollment code either.</strong> Codes start
+  <code>ocm_enroll_</code> and provider tokens <code>ocm_host_</code>; developer keys start
+  <code>ocm_live_</code> and are refused here. This is the most common reason a new provider
+  never appears.</div>
 </div>
 
 <div class="step">
@@ -452,11 +485,12 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
 <div class="step">
   <h3><span class="num">4</span>Run it</h3>
   <code class="cmd">sudo OCM_AGENT_ID="my-mac" sh install.sh</code>
-  <p class="cap">It asks for your provider token with typing hidden, so the token never
-  lands in shell history or the process list. Do not put the token on the command line.
-  The token is checked against the gateway before anything is written, so a bad one fails
-  here with the reason. Keep <code>OCM_AGENT_ID</code> the same on every reinstall, or the
-  machine registers as a second provider instead of recovering the first.</p>
+  <p class="cap">It asks for your enrollment code (or a provider token) with typing hidden,
+  so nothing lands in shell history or the process list. Do not put either on the command
+  line. The code is exchanged and the resulting token checked against the gateway before
+  anything is written, so a bad one fails here with the reason. Keep
+  <code>OCM_AGENT_ID</code> the same on every reinstall: it is the name the token is bound
+  to, and a different name registers a second provider instead of recovering the first.</p>
 </div>
 
 <div class="step">
@@ -500,11 +534,12 @@ Verify before installing:
    /Library/LaunchDaemons, and sends the token only to /v1/provider/verify.
 5. \`brew install uv\` first if Homebrew is present, to skip the root-shell step.
 
-Ask the user for a PROVIDER TOKEN starting ocm_host_, issued in the console under
-New provider token. A developer key (ocm_live_) is refused.
+Ask the user for an ENROLLMENT CODE starting ocm_enroll_, issued in the console under
+Enroll a Mac (valid 15 minutes, works once). A provider token starting ocm_host_ also
+works. A developer key (ocm_live_) is refused.
 
-Never put the token on a command line: it would sit in shell history and be visible
-to any local user through ps. The installer asks for it with typing hidden:
+Never put the code or a token on a command line: it would sit in shell history and be
+visible to any local user through ps. The installer asks for it with typing hidden:
 
   sudo OCM_AGENT_ID="a-stable-name" sh install.sh
 
