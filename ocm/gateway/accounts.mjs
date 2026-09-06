@@ -138,6 +138,20 @@ export class PgAccounts {
     return rows;
   }
 
+  /**
+   * Unrevoked credentials whose label is exactly `label` (case-sensitive, whole
+   * string). Labels are free text, so `mac` prefixes `mac-2`: a substring or LIKE
+   * match here can revoke the token a machine is actively using. The caller must
+   * refuse unless exactly one row comes back.
+   */
+  async findByLabel(accountId, label) {
+    if (!accountId || typeof label !== 'string' || !label) return [];
+    const { rows } = await this.pool.query(
+      `SELECT id, kind, label FROM credentials
+        WHERE account_id = $1 AND label = $2 AND revoked_at IS NULL`, [accountId, label]);
+    return rows;
+  }
+
   async accountFor(accountId) {
     const { rows } = await this.pool.query(`SELECT id, email FROM accounts WHERE id = $1`, [accountId]);
     return rows[0] || null;
@@ -240,6 +254,13 @@ export class MemoryAccounts {
   async credentialActive(credentialId) {
     const c = this.creds.get(credentialId);
     return !!c && !c.revoked_at;
+  }
+
+  async findByLabel(accountId, label) {
+    if (!accountId || typeof label !== 'string' || !label) return [];
+    return [...this.creds.values()]
+      .filter((c) => c.account_id === accountId && !c.revoked_at && c.label === label)
+      .map(({ id, kind, label: l }) => ({ id, kind, label: l }));
   }
 
   async claimAgent(credentialId, agentId) {

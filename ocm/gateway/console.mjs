@@ -198,6 +198,7 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const credRows = creds.length ? creds.map((c) => `<tr>
     <td>${c.kind === 'developer_key' ? 'Developer key' : 'Provider token'}</td>
     <td>${esc(c.label || '—')}</td>
+    <td><code>${esc(c.id)}</code></td>
     <td>${c.kind === 'provider_token'
       ? (c.bound_agent_id ? `<code>${esc(c.bound_agent_id)}</code>` : '<span class="muted">unclaimed</span>')
       : '<span class="muted">—</span>'}</td>
@@ -249,8 +250,10 @@ ${redeemBlock}
 
 <h2>Credentials</h2>
 <div class="tablewrap">${credRows ? `<table class="data">
-<thead><tr><th>Kind</th><th>Label</th><th>Machine</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+<thead><tr><th>Kind</th><th>Label</th><th>Id</th><th>Machine</th><th>Created</th><th>Last used</th><th></th></tr></thead>
 <tbody>${credRows}</tbody></table>` : '<div class="empty">No credentials yet.</div>'}</div>
+${creds.length ? `<p class="muted" style="margin-top:8px">Labels are free text and can collide.
+Act on a credential by its <strong>id</strong>: the buttons here do, and scripted revocation should too.</p>` : ''}
 ${creds.some((c) => c.kind === 'provider_token') ? `<p class="muted" style="margin-top:8px">A provider
 token claims the first machine that uses it and will not work from another one.
 <strong>Release</strong> frees it for a different machine, for instance after a rebuild.</p>` : ''}

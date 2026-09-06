@@ -564,8 +564,22 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
         }
         if (req.method === 'POST' && url.pathname === '/admin/revoke') {
           const body = JSON.parse(await readBody(req) || '{}');
-          if (!body.credential_id) return apiError(res, 400, 'credential_id is required');
-          return json(res, 200, { revoked: await accounts.revoke(body.credential_id) });
+          // Revoke by id. A label is accepted only as an exact, whole-string match
+          // scoped to one account, and only when it identifies exactly one live
+          // credential: labels are free text, so `mac` is a prefix of `mac-2` and a
+          // looser match would revoke the token a machine is actively using.
+          let id = body.credential_id;
+          if (!id && body.label !== undefined) {
+            if (!body.account_id) return apiError(res, 400, 'label lookup requires account_id');
+            const matches = await accounts.findByLabel(body.account_id, body.label);
+            if (matches.length === 0) return apiError(res, 404, 'no live credential has exactly that label');
+            if (matches.length > 1) {
+              return apiError(res, 409, `${matches.length} live credentials share that label; revoke by credential_id`);
+            }
+            id = matches[0].id;
+          }
+          if (!id) return apiError(res, 400, 'credential_id is required');
+          return json(res, 200, { revoked: await accounts.revoke(id), credential_id: id });
         }
         return apiError(res, 404, `no admin route for ${req.method} ${url.pathname}`);
       }
