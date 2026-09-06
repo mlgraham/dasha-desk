@@ -20,8 +20,8 @@ broken OAuth start, and a wrong mint are failures.
 | `/which` | Other-coin page. |
 | `/bag` | On-chain facts. |
 | `/simp` | Quiz / board. |
-| `/lobby` | The one community room. |
-| `/chess` | Play on www. Client `var API` must be `https://lobby.getdasha.com` and must not be empty. Play/Find must not surface `bad response`. leftover `id=buy-share-x` stays gone. |
+| `/lobby` | The one community room. Official TG `https://t.me/+xB7S8mIQaKFiZjRh` may live in the footer. Quiet pin: no mint/Buy/Chess/TG dump. `id=forum-play` stays gone. |
+| `/chess` | Play on www. Client `var API` must be `https://lobby.getdasha.com` and must not be empty. Play/Find must not surface `bad response`. Official footer TG allowed. leftover `id=buy-share-x` and `id=buy-share-tg` stay gone. |
 | `/faucet` | Public faucet. |
 | `/privacy` | Real Privacy page, H1 Privacy. **Not** 308 home. |
 | `/contribute` | Contribute. |

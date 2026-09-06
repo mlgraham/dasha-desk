@@ -20,6 +20,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkComputeRelease } from './watch-compute-release.mjs';
 import { leftoverHits } from './leftover-chess.test.mjs';
+import { OFFICIAL_TG, pinDumpHits, unofficialTelegramHrefs } from './leftover-lobby.test.mjs';
 
 export const MINT = '53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump';
 export const ORIGIN = 'https://www.getdasha.com';
@@ -323,12 +324,24 @@ export async function runWatch({ probe, skipPages = false } = {}) {
   await page200(bag, probe, '/lobby', {
     h1: true,
     match: [[/lobby|chat|forum|community|simp/i, '/lobby: missing community room']],
+    forbid: [
+      [/id=["']forum-play["']/, '/lobby: leftover id=forum-play'],
+    ],
+    after: async (b, html) => {
+      fail(b, pinDumpHits(html).length === 0, '/lobby: quiet pin dumped mint/Buy/Chess/TG');
+      fail(
+        b,
+        unofficialTelegramHrefs(html).length === 0,
+        `/lobby: invented Telegram group — official is ${OFFICIAL_TG}`,
+      );
+    },
   });
 
   await page200(bag, probe, '/chess', {
     heading: true,
     forbid: [
       [/id=["']buy-share-x["']/, '/chess: leftover id=buy-share-x'],
+      [/id=["']buy-share-tg["']/, '/chess: leftover id=buy-share-tg'],
     ],
     after: async (b, html) => {
       const api = chessApi(html);
@@ -344,6 +357,11 @@ export async function runWatch({ probe, skipPages = false } = {}) {
       fail(b, !playFindSurfacesBadResponse(html), '/chess: Play/Find surfaced "bad response"');
       const leftover = leftoverHits(html);
       fail(b, leftover.length === 0, `/chess: leftover after style+script strip — ${leftover.join(', ')}`);
+      fail(
+        b,
+        unofficialTelegramHrefs(html).length === 0,
+        `/chess: invented Telegram group — official is ${OFFICIAL_TG}`,
+      );
     },
   });
 

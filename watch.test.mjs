@@ -240,6 +240,85 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
   assert.ok(bag.failures.some((f) => /dasha-compute-open-alpha\.tar\.gz: missing provenance archive/.test(f)), bag.failures.join('\n'));
 }
 
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/lobby`]: {
+        status: 200,
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.equal(bag.failures.length, 0, `official footer TG must pass:\n${bag.failures.join('\n')}`);
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/lobby`]: {
+        status: 200,
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><p class="forum-pin"><span class="forum-ca">53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump</span> <a href="https://t.me/+xB7S8mIQaKFiZjRh">TG</a></p>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.ok(bag.failures.some((f) => /quiet pin dumped/.test(f)), bag.failures.join('\n'));
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/lobby`]: {
+        status: 200,
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><footer><a href="https://t.me/dashacommunity">Telegram</a></footer>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.ok(bag.failures.some((f) => /invented Telegram group/.test(f)), bag.failures.join('\n'));
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/lobby`]: {
+        status: 200,
+        body: '<!doctype html><h1>Lobby</h1><p>The one community room.</p><section id="forum-play">Play</section>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.ok(bag.failures.some((f) => /leftover id=forum-play/.test(f)), bag.failures.join('\n'));
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/chess`]: {
+        status: 200,
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.equal(bag.failures.length, 0, `official chess footer TG must pass:\n${bag.failures.join('\n')}`);
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/chess`]: {
+        status: 200,
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><a id="buy-share-tg" href="https://t.me/+xB7S8mIQaKFiZjRh">TG</a>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.ok(bag.failures.some((f) => /leftover id=buy-share-tg/.test(f)), bag.failures.join('\n'));
+  assert.ok(!bag.failures.some((f) => /invented Telegram group/.test(f)), bag.failures.join('\n'));
+}
+
 const cli = spawnSync(process.execPath, ['watch.mjs', '--fixture', '--json'], {
   cwd: here,
   encoding: 'utf8',
