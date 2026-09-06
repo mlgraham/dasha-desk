@@ -133,17 +133,20 @@ matches "$AGENT_ID" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_AGENT_ID may contain only letters, numbers, dot, underscore and hyphen (64 max)"
 
 # An enrollment code is exchanged for a provider token before anything else happens.
-# The code travels in a JSON body over HTTPS, never in a URL, a log line or argv; the
+# The code travels in a JSON body over HTTPS on curl's stdin, never in a URL, a log
+# line or argv (--data "…" would be argv, visible in ps); the
 # gateway mints a token already bound to this agent id and revokes any older token
 # bound to the same id on the same account, so re-enrolling is how a machine rotates.
 if matches "$OCM_HOST_TOKEN" '^ocm_enroll_[-A-Za-z0-9_]{16,}$'; then
   printf 'exchanging the enrollment code for a provider token …\n'
-  ENROLL=$(curl_https --fail -H 'content-type: application/json' \
-    --data "{\"code\":\"$OCM_HOST_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
-    "$SOURCE/v1/provider/enroll" 2>/dev/null) || {
-    REASON=$(curl_https -H 'content-type: application/json' \
-      --data "{\"code\":\"$OCM_HOST_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
-      "$SOURCE/v1/provider/enroll" 2>/dev/null \
+  # The body reaches curl on stdin (--data @-). --data "…" would be argv, visible in
+  # ps for the life of the request; printf is a builtin, so the code is never an
+  # argument to any process.
+  ENROLL_BODY="{\"code\":\"$OCM_HOST_TOKEN\",\"agent_id\":\"$AGENT_ID\"}"
+  ENROLL=$(printf '%s' "$ENROLL_BODY" | curl_https --fail -H 'content-type: application/json' \
+    --data @- "$SOURCE/v1/provider/enroll" 2>/dev/null) || {
+    REASON=$(printf '%s' "$ENROLL_BODY" | curl_https -H 'content-type: application/json' \
+      --data @- "$SOURCE/v1/provider/enroll" 2>/dev/null \
       | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
     die "${REASON:-could not reach $SOURCE to exchange the enrollment code}
   nothing was installed"
@@ -329,16 +332,15 @@ if printf '%s\n' "$NEW_TOKEN" | LC_ALL=C grep -Eq '^ocm_enroll_[-A-Za-z0-9_]{16,
   printf '%s\n' "$AGENT_ID" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
     || { echo "error: unsafe or missing OCM_AGENT_ID in /etc/ocm/agent.env" >&2; exit 1; }
   printf 'exchanging the enrollment code ...\n'
-  ENROLL=$(curl --silent --show-error --location --fail \
+  ENROLL_BODY="{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}"
+  ENROLL=$(printf '%s' "$ENROLL_BODY" | curl --silent --show-error --location --fail \
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
     -H 'content-type: application/json' \
-    --data "{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
-    "$BASE/v1/provider/enroll" 2>/dev/null) || {
-    curl --silent --show-error --location \
+    --data @- "$BASE/v1/provider/enroll" 2>/dev/null) || {
+    printf '%s' "$ENROLL_BODY" | curl --silent --show-error --location \
       --proto '=https' --proto-redir '=https' --tlsv1.2 \
       -H 'content-type: application/json' \
-      --data "{\"code\":\"$NEW_TOKEN\",\"agent_id\":\"$AGENT_ID\"}" \
-      "$BASE/v1/provider/enroll" 2>/dev/null \
+      --data @- "$BASE/v1/provider/enroll" 2>/dev/null \
       | sed -n 's/.*"message":"\([^"]*\)".*/error: \1/p' >&2
     echo "nothing was changed" >&2
     exit 1

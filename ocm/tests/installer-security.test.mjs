@@ -248,7 +248,9 @@ test('an enrollment code is exchanged for a bound token, in a body, before anyth
   // The code and the token are secrets: JSON body over HTTPS through curl_https,
   // never a query string, never argv of anything but curl, never printed.
   assert.match(block, /curl_https --fail -H 'content-type: application\/json'/);
-  assert.match(block, /--data "\{\\"code\\":\\"\$OCM_HOST_TOKEN\\",\\"agent_id\\":\\"\$AGENT_ID\\"\}"/);
+  assert.match(block, /printf '%s' "\$ENROLL_BODY" \| curl_https/, 'the code reaches curl on stdin');
+  assert.match(block, /--data @-/);
+  assert.doesNotMatch(source, /--data "\{/, '--data "…" is argv and shows the code in ps for the life of the request');
   assert.match(block, /"\$SOURCE\/v1\/provider\/enroll"/);
   assert.doesNotMatch(source, /enroll\?/);
   assert.doesNotMatch(source, /[?&]code=/);
@@ -283,7 +285,8 @@ test('the rotation helper accepts an enrollment code and exchanges it the same w
     'code exchange -> token-shape check -> verify, so a bad exchange never reaches the env file');
   assert.match(helper, /AGENT_ID=\$\(sed -n 's\|\^OCM_AGENT_ID=\|\|p' \/etc\/ocm\/agent\.env\)/,
     'the helper enrolls under the id already recorded on this machine');
-  assert.match(helper, /--data "\{\\"code\\":\\"\$NEW_TOKEN\\",\\"agent_id\\":\\"\$AGENT_ID\\"\}"/);
+  assert.match(helper, /printf '%s' "\$ENROLL_BODY" \| curl/, 'the rotation helper also feeds the code on stdin');
+  assert.match(helper, /--data @-/);
   assert.match(helper, /"\$BASE\/v1\/provider\/enroll"/);
   assert.match(helper, /Provider token or enrollment code \(input is hidden\): /);
   assert.match(helper, /do not pass the token on the command line/);
