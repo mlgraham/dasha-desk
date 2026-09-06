@@ -19,6 +19,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkComputeRelease } from './watch-compute-release.mjs';
+import { leftoverHits } from './leftover-chess.test.mjs';
 
 export const MINT = '53uxQtB9pcjWvCHguz3JTTndvuKqGxhrD37EetnCpump';
 export const ORIGIN = 'https://www.getdasha.com';
@@ -326,6 +327,9 @@ export async function runWatch({ probe, skipPages = false } = {}) {
 
   await page200(bag, probe, '/chess', {
     heading: true,
+    forbid: [
+      [/id=["']buy-share-x["']/, '/chess: leftover id=buy-share-x'],
+    ],
     after: async (b, html) => {
       const api = chessApi(html);
       fail(b, api !== null, '/chess: var API is missing');
@@ -338,6 +342,8 @@ export async function runWatch({ probe, skipPages = false } = {}) {
         );
       }
       fail(b, !playFindSurfacesBadResponse(html), '/chess: Play/Find surfaced "bad response"');
+      const leftover = leftoverHits(html);
+      fail(b, leftover.length === 0, `/chess: leftover after style+script strip — ${leftover.join(', ')}`);
     },
   });
 

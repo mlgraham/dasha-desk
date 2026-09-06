@@ -2,7 +2,7 @@
   "name": "dasha-desk",
   "private": true,
   "scripts": {
-    "test": "node build.mjs --check && node dasha-share.test.mjs && node dasha-oss-docs.test.mjs && node dasha-mint-consistency.test.mjs && node dasha-desk-resilience.test.mjs && node dasha-build-protocol.test.mjs && node home/home.test.mjs && node lobby/lobby.test.mjs && node dasha-surfaces.test.mjs && node bounties/bounties.test.mjs && node watch.test.mjs && node --test compute/tests/*.test.mjs"
+    "test": "node build.mjs --check && node dasha-share.test.mjs && node dasha-oss-docs.test.mjs && node dasha-mint-consistency.test.mjs && node dasha-desk-resilience.test.mjs && node dasha-build-protocol.test.mjs && node home/home.test.mjs && node lobby/lobby.test.mjs && node leftover-chess.test.mjs && node dasha-surfaces.test.mjs && node bounties/bounties.test.mjs && node watch.test.mjs && node --test compute/tests/*.test.mjs"
   },
   "devDependencies": {
     "puppeteer-core": "25.9.0"

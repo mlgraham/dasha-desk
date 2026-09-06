@@ -21,7 +21,7 @@ broken OAuth start, and a wrong mint are failures.
 | `/bag` | On-chain facts. |
 | `/simp` | Quiz / board. |
 | `/lobby` | The one community room. |
-| `/chess` | Play on www. Client `var API` must be `https://lobby.getdasha.com` and must not be empty. Play/Find must not surface `bad response`. |
+| `/chess` | Play on www. Client `var API` must be `https://lobby.getdasha.com` and must not be empty. Play/Find must not surface `bad response`. leftover `id=buy-share-x` stays gone. |
 | `/faucet` | Public faucet. |
 | `/privacy` | Real Privacy page, H1 Privacy. **Not** 308 home. |
 | `/contribute` | Contribute. |

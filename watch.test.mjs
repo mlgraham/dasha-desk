@@ -151,6 +151,32 @@ assert.equal(baseline.failures.length, 0, `good fixtures must pass:\n${baseline.
 }
 
 {
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/chess`]: {
+        status: 200,
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><p id="buy-flash" hidden>bought. <a id="buy-share-x" href="https://x.com/intent/post">X</a></p>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.ok(bag.failures.some((f) => /leftover id=buy-share-x/.test(f)), bag.failures.join('\n'));
+}
+
+{
+  const bag = await runWatch({
+    probe: overlay(good, {
+      [`${ORIGIN}/chess`]: {
+        status: 200,
+        body: '<!doctype html><h1>Chess</h1><script>var API=\'https://lobby.getdasha.com\';</script><button id="gate-action">Play</button><button id="gate-find">Find</button><footer><a href="https://t.me/+xB7S8mIQaKFiZjRh">Telegram</a></footer>',
+      },
+    }),
+    skipPages: true,
+  });
+  assert.equal(bag.failures.length, 0, `official chess footer TG without leftover id must pass:\n${bag.failures.join('\n')}`);
+}
+
+{
   const pin = readFileSync(join(fixtureDir, 'home.html'), 'utf8');
   const stale = pin.replace(
     'sha384-FzI+vBDCbm64kOB54trhapHWjR6ugybc4wrY8GMgqEYeUJ4rTg1mCO+w2bS4HKNp',
