@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { renderProviderGuide } from '../gateway/console.mjs';
 
 const source = readFileSync(new URL('../agent/install.sh', import.meta.url), 'utf8');
@@ -193,4 +194,43 @@ test('the installer never logs the provider token', () => {
       `token rotator must not print the token: ${line}`);
   }
   assert.doesNotMatch(source, /^\s*set -x/m);
+});
+
+test('the update helper reinstalls from what is on disk and never exposes the token', () => {
+  const start = source.indexOf("cat > \"$PREFIX/bin/ocm-agent-update\" <<'UPD'");
+  assert.ok(start > 0, 'install.sh must install ocm-agent-update');
+  const end = source.indexOf('\nUPD\n', start);
+  assert.ok(end > start);
+  const helper = source.slice(source.indexOf('\n', start) + 1, end + 1);
+  // It is a reinstall with the values already on disk, gated by the same checksum a
+  // human is told to verify, and the token travels in a root-only file.
+  assert.match(helper, /shasum -a 256 -c install\.sh\.sha256/);
+  assert.match(helper, /does not match its published checksum; nothing was changed/);
+  assert.match(helper, /OCM_HOST_TOKEN_FILE="\$WORK\/token"/);
+  assert.match(helper, /umask 077/);
+  assert.match(helper, /trap 'rm -rf "\$WORK"'/);
+  assert.match(helper, /provider environment may not be owned by root/);
+  assert.match(helper, /--check/);
+  // Never the token on argv or in a visible environment assignment.
+  // (the sed that reads the env file mentions the key after a `^` anchor; that is a
+  // pattern, not an assignment)
+  assert.doesNotMatch(helper, /(^|[\s;])OCM_HOST_TOKEN=/m);
+  assert.doesNotMatch(helper, COPY_PASTE_TOKEN_ARGV);
+  // The installer overwrites the helper while it runs; it must continue from a snapshot.
+  assert.match(helper, /OCM_UPDATE_WORK/);
+  assert.match(helper, /cp \/opt\/ocm\/bin\/ocm-agent-update "\$WORK\/self"/);
+  // No shell expansion leaks: the heredoc is quoted, and the generated file is valid sh.
+  assert.match(source, /<<'UPD'\n/);
+  const check = spawnSync('sh', ['-n'], { input: helper, encoding: 'utf8' });
+  assert.equal(check.status, 0, check.stderr);
+  // It is installed executable, after the rotation helper and before launchd is touched.
+  const chmod = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-update"');
+  const token = source.indexOf('chmod 755 "$PREFIX/bin/ocm-agent-token"');
+  const bootout = source.indexOf('launchctl bootout system/com.ocm.agent 2>/dev/null || true');
+  assert.ok(token < start && chmod > end && chmod < bootout);
+  // And it is documented where a provider will look.
+  assert.match(source, /update\s+sudo \$PREFIX\/bin\/ocm-agent-update/);
+  const guide = renderProviderGuide({ apiHost: 'api.example', models: ['ocm-coder'] });
+  assert.match(guide, /sudo \/opt\/ocm\/bin\/ocm-agent-update/);
+  assert.match(guide, /--check/);
 });

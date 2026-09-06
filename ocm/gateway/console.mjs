@@ -474,6 +474,14 @@ history. Automation can pipe the token on stdin or set <code>OCM_HOST_TOKEN_FILE
 <strong>Do not edit</strong> <code>/opt/ocm/bin/ocm-agent-run</code>, which is generated on
 every reinstall and holds no token.</p>
 
+<h2>Updating later</h2>
+<code class="cmd">sudo /opt/ocm/bin/ocm-agent-update</code>
+<p class="cap">Moves this machine to the current agent build with nothing to retype: it reads
+the settings and token already on disk, fetches the current installer from the same
+gateway, checks its published checksum, and runs it. The new agent has to pass its own
+check as your account before anything is replaced. Add <code>--check</code> to see whether
+a new build exists without changing anything.</p>
+
 <details><summary>Setting this up with an AI agent</summary><div class="body">
 <p class="cap">Paste this to it.</p>
 <pre>You are installing the OCM provider agent on this Mac. It contributes idle GPU to a
@@ -505,6 +513,7 @@ Inference runs as the invoking user, not root.
 Confirm with: /opt/ocm/bin/ocm-agent-run --doctor   (expect: token ok)
 The first request takes up to ~90s while the model loads. That is not a fault.
 Rotate later with: sudo /opt/ocm/bin/ocm-agent-token   (it prompts; or pipe on stdin)
+Update later with: sudo /opt/ocm/bin/ocm-agent-update  (--check to only look; no token needed)
 Never edit /opt/ocm/bin/ocm-agent-run; it is generated and holds no token.
 
 Tell the user plainly: as a provider they can read every prompt routed to this

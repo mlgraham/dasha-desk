@@ -2,7 +2,7 @@
 # OCM provider installer for macOS (Apple Silicon).
 #
 # Read this before running it: piping an unread script into a shell is a bad habit.
-# It is about 350 lines. The two parts worth your attention are the token check at the
+# It is about 450 lines. The two parts worth your attention are the token check at the
 # top, which runs before anything is written, and the launchd handling at the end.
 #
 # What it does:
@@ -301,6 +301,90 @@ echo "watch it connect:  tail -f /var/log/ocm-agent.log"
 TOK
 chmod 755 "$PREFIX/bin/ocm-agent-token"   # readable for the same reason
 
+# Fixes reached existing hosts only on reinstall, and a reinstall needs a token that
+# was shown once; a bare file swap leaves old modes and config behind. This does the
+# reinstall with what is already on disk, so nothing is retyped and nothing is skipped.
+cat > "$PREFIX/bin/ocm-agent-update" <<'UPD'
+#!/bin/sh
+# Move this machine to the current agent build without retyping anything.
+#   sudo /opt/ocm/bin/ocm-agent-update            # update
+#   sudo /opt/ocm/bin/ocm-agent-update --check    # report only; change nothing
+#
+# It reads /etc/ocm/agent.env, fetches the current installer from the same gateway,
+# verifies the published checksum, and runs the installer with the token handed over
+# in a root-only temporary file — never on a command line. The installer then proves
+# the new agent's doctor path as the runtime account before replacing anything,
+# exactly as a first install does.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+[ "$(id -u)" = "0" ] || { echo "run with sudo" >&2; exit 1; }
+CHECK=0
+[ $# -le 1 ] || { echo "usage: ocm-agent-update [--check]" >&2; exit 1; }
+case "${1:-}" in
+  "") ;;
+  --check) CHECK=1 ;;
+  *) echo "usage: ocm-agent-update [--check]" >&2; exit 1 ;;
+esac
+umask 077
+# The installer rewrites this very file while it runs, and sh reads scripts lazily
+# by byte offset, so the live file only takes a private snapshot of itself and runs
+# that. The snapshot inherits the work directory; the live file owns its cleanup.
+if [ -z "${OCM_UPDATE_WORK:-}" ]; then
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/ocm-update.XXXXXX")
+  trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+  cp /opt/ocm/bin/ocm-agent-update "$WORK/self"
+  OCM_UPDATE_WORK="$WORK" sh "$WORK/self" "$@"
+  exit $?
+fi
+WORK="$OCM_UPDATE_WORK"
+ENV=/etc/ocm/agent.env
+[ -r "$ENV" ] || { echo "error: $ENV is missing; this machine was not set up by install.sh — run the installer once" >&2; exit 1; }
+OWNER=$(stat -f '%Su' "$ENV" 2>/dev/null || true)
+printf '%s\n' "$OWNER" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
+  || { echo "error: could not identify the provider account" >&2; exit 1; }
+[ "$OWNER" != root ] || { echo "error: the provider environment may not be owned by root" >&2; exit 1; }
+val() { sed -n "s|^$1=||p" "$ENV" | head -1; }
+GATEWAY=$(val OCM_GATEWAY_URL); AGENT_ID=$(val OCM_AGENT_ID); MODEL_MAP=$(val OCM_MODEL_MAP)
+printf '%s\n' "$GATEWAY" | LC_ALL=C grep -Eq '^wss://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' \
+  || { echo "error: unsafe or missing gateway URL in $ENV" >&2; exit 1; }
+printf '%s\n' "$AGENT_ID" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._]{1,64}$' \
+  || { echo "error: unsafe or missing OCM_AGENT_ID in $ENV" >&2; exit 1; }
+BASE=$(printf '%s\n' "$GATEWAY" | sed 's|^wss://|https://|')
+UV=$(sed -n 's/^exec "\([^"]*\)" run .*/\1/p' /opt/ocm/bin/ocm-agent-run 2>/dev/null | head -1)
+[ -n "$UV" ] && [ -x "$UV" ] \
+  || { echo "error: could not find uv via /opt/ocm/bin/ocm-agent-run; rerun the installer with OCM_UV_BIN" >&2; exit 1; }
+fetch() {
+  curl --silent --show-error --location --fail \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 "$@"
+}
+fetch "$BASE/install.sh" -o "$WORK/install.sh" \
+  || { echo "error: could not fetch $BASE/install.sh" >&2; exit 1; }
+fetch "$BASE/install.sh.sha256" -o "$WORK/install.sh.sha256" \
+  || { echo "error: could not fetch the installer checksum" >&2; exit 1; }
+( cd "$WORK" && shasum -a 256 -c install.sh.sha256 >/dev/null 2>&1 ) \
+  || { echo "error: the downloaded installer does not match its published checksum; nothing was changed" >&2; exit 1; }
+fetch "$BASE/agent.py" -o "$WORK/agent.py" \
+  || { echo "error: could not fetch $BASE/agent.py" >&2; exit 1; }
+if cmp -s "$WORK/agent.py" /opt/ocm/agent/agent.py; then AGENT_STATE="already current"
+else AGENT_STATE="new build available"; fi
+printf 'OCM provider update\n  host     %s\n  user     %s\n  gateway  %s\n  agent    %s\n' \
+  "$AGENT_ID" "$OWNER" "$GATEWAY" "$AGENT_STATE"
+if [ "$CHECK" = 1 ]; then
+  echo "check only; nothing was changed"
+  exit 0
+fi
+# The token goes to the installer in a root-only file under $WORK, which the trap
+# removes; it is never placed on a command line or in a visible environment.
+sed -n 's/^OCM_HOST_TOKEN=//p' "$ENV" | head -1 > "$WORK/token"
+[ -s "$WORK/token" ] || { echo "error: no OCM_HOST_TOKEN in $ENV; run ocm-agent-token first" >&2; exit 1; }
+cd /
+OCM_HOST_TOKEN_FILE="$WORK/token" OCM_AGENT_ID="$AGENT_ID" OCM_MODEL_MAP="$MODEL_MAP" \
+  OCM_RUN_USER="$OWNER" OCM_UV_BIN="$UV" OCM_GATEWAY_URL="$GATEWAY" \
+  sh "$WORK/install.sh"
+UPD
+chmod 755 "$PREFIX/bin/ocm-agent-update"
+
 # launchd opens the log as RUN_USER. Pre-create it owner-only rather than relying on
 # launchd to create a world-readable root log or failing because /var/log is closed.
 touch /var/log/ocm-agent.log
@@ -352,6 +436,7 @@ installed. Inference runs as $RUN_USER, never as root.
   logs     tail -f /var/log/ocm-agent.log
   check    sudo -u $RUN_USER $PREFIX/bin/ocm-agent-run --doctor
   rotate   sudo $PREFIX/bin/ocm-agent-token
+  update   sudo $PREFIX/bin/ocm-agent-update      (--check to only look)
   stop     sudo launchctl bootout system/com.ocm.agent
   remove   sudo launchctl bootout system/com.ocm.agent; sudo rm -rf $PREFIX /etc/ocm \\
              /Library/LaunchDaemons/com.ocm.agent.plist /var/log/ocm-agent.log
