@@ -56,6 +56,24 @@ test('every shell-sourced provider value is constrained before agent.env is writ
     'validation must happen before the provider environment file is written');
 });
 
+test('no regex in the installer uses a repetition bound BSD grep rejects', () => {
+  // macOS 15 ships BSD grep with RE_DUP_MAX 255. `{1,512}` is not "a wide bound" there,
+  // it is "maximum repetition exceeds 255" and a dead installer. Found on the first
+  // real Mac the reinstall path met, after every test had passed on GNU grep and a
+  // newer macOS. Bound length with ${#} instead; patterns bound shape only.
+  const tooWide = [...source.matchAll(/\{(\d+),(\d+)\}/g)]
+    .filter((m) => Number(m[1]) > 255 || Number(m[2]) > 255)
+    .map((m) => m[0]);
+  assert.deepEqual(tooWide, [],
+    `repetition bounds above 255 abort BSD grep on macOS: ${tooWide.join(', ')}`);
+  assert.match(source, /\[ "\$\{#1\}" -gt "\$3" \]/,
+    'matches() must enforce length itself, since the pattern no longer can');
+  for (const [variable, max] of [['MLX_MODEL', 512], ['MODEL_MAP', 2048], ['UV', 512]]) {
+    assert.match(source, new RegExp(`matches "\\$${variable}" '[^']+' ${max}`),
+      `${variable} must still have an explicit length limit of ${max}`);
+  }
+});
+
 test('the inference daemon is explicitly forbidden from running as root', () => {
   assert.match(source, /RUN_USER="\$\{OCM_RUN_USER:-\$\{SUDO_USER:-\}\}"/);
   assert.match(source, /\[ "\$RUN_USER" != root \] \|\| die/,
@@ -79,6 +97,25 @@ test('provider secrets and logs are owned only by the unprivileged runtime accou
   assert.match(section, /touch \/var\/log\/ocm-agent\.log/);
   assert.match(section, /chown "\$RUN_USER" \/var\/log\/ocm-agent\.log/);
   assert.match(section, /chmod 600 \/var\/log\/ocm-agent\.log/);
+});
+
+test('the resolved token is exported before the doctor runs under sudo', () => {
+  // The prompt, OCM_HOST_TOKEN_FILE and stdin paths set a shell variable, and
+  // `sudo --preserve-env=OCM_HOST_TOKEN` carries only exported variables. Every path
+  // except the human --preserve-env one failed the doctor until this was added.
+  const exported = source.indexOf('\nexport OCM_HOST_TOKEN\n');
+  const doctor = source.indexOf('--preserve-env=OCM_HOST_TOKEN env');
+  assert.ok(exported > 0 && doctor > 0 && exported < doctor,
+    'install.sh must `export OCM_HOST_TOKEN` after resolving it and before the doctor');
+});
+
+test('the doctor runs from a directory the runtime account can enter', () => {
+  // `sudo -u ec2-user uv run` from /var/root (700) fails with "Current directory does
+  // not exist". Found on the first reinstall over SSM, where cwd is root's home.
+  const doctor = source.indexOf('"$UV" run --quiet --python 3.12 "$TMP_AGENT" --doctor');
+  const cd = source.lastIndexOf('\ncd /\n', doctor);
+  assert.ok(doctor > 0 && cd > 0 && cd < doctor,
+    'the installer must cd / before running the doctor as the runtime account');
 });
 
 test('the downloaded agent is proved before a working installation is replaced', () => {

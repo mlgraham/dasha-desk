@@ -2,7 +2,7 @@
 # OCM provider installer for macOS (Apple Silicon).
 #
 # Read this before running it: piping an unread script into a shell is a bad habit.
-# It is about 190 lines. The two parts worth your attention are the token check at the
+# It is about 350 lines. The two parts worth your attention are the token check at the
 # top, which runs before anything is written, and the launchd handling at the end.
 #
 # What it does:
@@ -60,7 +60,13 @@ RUN_USER="${OCM_RUN_USER:-${SUDO_USER:-}}"
 PREFIX=/opt/ocm
 
 die() { printf '\nerror: %s\n' "$1" >&2; exit 1; }
-matches() { printf '%s\n' "$1" | LC_ALL=C grep -Eq "$2"; }
+# Length is bounded by ${#} rather than in the pattern: BSD grep on macOS 15 rejects
+# any repetition bound above 255 ("maximum repetition exceeds 255"), so a 512-wide bound
+# aborted the installer on the first real Mac it met.
+matches() {
+  if [ -n "${3:-}" ] && [ "${#1}" -gt "$3" ]; then return 1; fi
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq "$2"
+}
 curl_https() {
   curl --silent --show-error --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 "$@"
@@ -74,7 +80,7 @@ curl_https() {
 # on sudo's environment command line would also put it in shell history and
 # the process list. Never print the value.
 if [ -z "${OCM_HOST_TOKEN:-}" ] && [ -n "${OCM_HOST_TOKEN_FILE:-}" ]; then
-  matches "$OCM_HOST_TOKEN_FILE" '^/[-A-Za-z0-9._/+]{1,512}$' \
+  matches "$OCM_HOST_TOKEN_FILE" '^/[-A-Za-z0-9._/+]+$' 512 \
     || die "OCM_HOST_TOKEN_FILE must be a safe absolute path"
   [ -f "$OCM_HOST_TOKEN_FILE" ] && [ -r "$OCM_HOST_TOKEN_FILE" ] \
     || die "OCM_HOST_TOKEN_FILE is missing or unreadable"
@@ -96,6 +102,11 @@ if [ -z "${OCM_HOST_TOKEN:-}" ]; then
   fi
 fi
 [ -n "${OCM_HOST_TOKEN:-}" ] || die "provide OCM_HOST_TOKEN via --preserve-env, OCM_HOST_TOKEN_FILE, stdin, or the hidden prompt"
+# The prompt, file and stdin paths leave this as a plain shell variable. The doctor
+# below runs under `sudo -u … --preserve-env=OCM_HOST_TOKEN`, which can only carry an
+# exported one; without this line every path except --preserve-env failed the doctor
+# with "OCM_HOST_TOKEN is not set".
+export OCM_HOST_TOKEN
 [ -n "$RUN_USER" ] || die "run through sudo from the account that should run inference, or set OCM_RUN_USER"
 [ "$RUN_USER" != root ] || die "the OCM inference daemon may not run as root; set OCM_RUN_USER to a normal account"
 
@@ -110,9 +121,9 @@ matches "$OCM_HOST_TOKEN" '^ocm_host_[-A-Za-z0-9_]{16,}$' \
   || die "OCM_HOST_TOKEN must be an issued provider token beginning ocm_host_"
 matches "$AGENT_ID" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_AGENT_ID may contain only letters, numbers, dot, underscore and hyphen (64 max)"
-matches "$MLX_MODEL" '^[-A-Za-z0-9._/:@+]{1,512}$' \
+matches "$MLX_MODEL" '^[-A-Za-z0-9._/:@+]+$' 512 \
   || die "OCM_MLX_MODEL contains unsupported characters or is too long"
-matches "$MODEL_MAP" '^[-A-Za-z0-9._/:@=,+]{1,2048}$' \
+matches "$MODEL_MAP" '^[-A-Za-z0-9._/:@=,+]+$' 2048 \
   || die "OCM_MODEL_MAP contains unsupported characters or is too long"
 matches "$RUN_USER" '^[-A-Za-z0-9._]{1,64}$' \
   || die "OCM_RUN_USER contains unsupported characters"
@@ -120,7 +131,7 @@ id "$RUN_USER" >/dev/null 2>&1 || die "OCM_RUN_USER does not name a local accoun
 RUN_HOME=$(dscl . -read "/Users/$RUN_USER" NFSHomeDirectory 2>/dev/null \
   | awk '{ print $2; exit }')
 [ -n "$RUN_HOME" ] || die "could not determine the home directory for OCM_RUN_USER"
-matches "$RUN_HOME" '^/[-A-Za-z0-9._/+]{1,512}$' \
+matches "$RUN_HOME" '^/[-A-Za-z0-9._/+]+$' 512 \
   || die "the provider account home directory contains unsupported characters"
 
 # Require uv rather than piping a third party installer into a root shell. Homebrew's
@@ -138,7 +149,7 @@ if [ -z "$UV" ]; then
 fi
 [ -n "$UV" ] && [ -x "$UV" ] \
   || die "uv is required before running this root installer. Install it yourself (for example: brew install uv), then rerun with OCM_UV_BIN=\"$(command -v uv 2>/dev/null || echo /opt/homebrew/bin/uv)\""
-matches "$UV" '^/[-A-Za-z0-9._/+]{1,512}$' \
+matches "$UV" '^/[-A-Za-z0-9._/+]+$' 512 \
   || die "OCM_UV_BIN must be a safe absolute executable path"
 sudo -u "$RUN_USER" test -x "$UV" \
   || die "OCM_UV_BIN is not executable by OCM_RUN_USER"
@@ -174,6 +185,10 @@ curl_https --fail "$SOURCE/agent.py" -o "$TMP_AGENT" \
 chmod 755 "$TMP_AGENT"
 
 printf 'checking the downloaded agent as %s …\n' "$RUN_USER"
+# Leave the caller's directory first. Run from root's home (an operator over SSM,
+# say) the unprivileged account cannot stat the cwd, and uv dies with "Current
+# directory does not exist" before the doctor runs at all.
+cd /
 sudo -u "$RUN_USER" --preserve-env=OCM_HOST_TOKEN env \
   HOME="$RUN_HOME" \
   OCM_GATEWAY_URL="$GATEWAY" \
