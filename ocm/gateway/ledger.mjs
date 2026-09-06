@@ -186,5 +186,27 @@ export class Ledger {
     };
   }
 
+  /**
+   * Usage since the start of the current UTC day: what the public status page shows
+   * as "served today". Grants are excluded, and nothing per-consumer is returned, so
+   * the result can be published as-is.
+   */
+  async servedToday(now = new Date()) {
+    this.#requireHealthy();
+    const since = startOfUtcDay(now);
+    const usage = this.entries.filter((e) => e.kind === 'usage' && new Date(e.at) >= since);
+    return {
+      since: since.toISOString(),
+      requests: usage.length,
+      prompt_tokens: usage.reduce((n, e) => n + e.promptTokens, 0),
+      completion_tokens: usage.reduce((n, e) => n + e.completionTokens, 0),
+    };
+  }
+
   async close() {}
+}
+
+/** Midnight UTC, so "today" means the same thing on every ledger backend. */
+export function startOfUtcDay(now = new Date()) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }

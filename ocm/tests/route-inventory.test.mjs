@@ -54,6 +54,8 @@ const ROUTES = [
     why: 'the landing page. Anonymous gets the sign-in form, never a dashboard' },
   { method: 'GET', path: '/console/provider', auth: 'public', unauth: 200,
     why: 'the recruiting guide. Holds no account data; it is the link prospects get' },
+  { method: 'GET', path: '/console/status', auth: 'public', unauth: 200,
+    why: 'providers online and tokens served. No owners, ids or balances, by design' },
 
   // ---- guarded --------------------------------------------------------------
   { method: 'GET', path: '/console/stats.json', auth: 'session', unauth: 401,

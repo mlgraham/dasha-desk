@@ -11,6 +11,7 @@
 import pg from 'pg';
 import { readFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { startOfUtcDay } from './ledger.mjs';
 
 const MAX_JOB_ID_LENGTH = 200;
 const ACCOUNTING_UNHEALTHY = 'ACCOUNTING_UNHEALTHY';
@@ -259,6 +260,23 @@ export class PgLedger {
         completion_tokens: Number(t.completion_tokens),
       },
       recent: recent.rows,
+    };
+  }
+
+  /** Same shape as Ledger#servedToday: usage rows since midnight UTC, no consumer ids. */
+  async servedToday(now = new Date()) {
+    const since = startOfUtcDay(now);
+    const { rows } = await this.#query(
+      `SELECT COUNT(*)::bigint AS requests,
+              COALESCE(SUM(prompt_tokens),0)::bigint AS prompt_tokens,
+              COALESCE(SUM(completion_tokens),0)::bigint AS completion_tokens
+         FROM usage_log WHERE kind='usage' AND at >= $1`, [since.toISOString()]);
+    const r = rows[0];
+    return {
+      since: since.toISOString(),
+      requests: Number(r.requests),
+      prompt_tokens: Number(r.prompt_tokens),
+      completion_tokens: Number(r.completion_tokens),
     };
   }
 

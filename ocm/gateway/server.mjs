@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret } from './console.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderStatus } from './console.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
 import { AccountExistsError, MemoryAccounts } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
@@ -382,6 +382,13 @@ export async function createGateway({
             account, apiHost, models: registry.models(), admin: isAdmin(account),
             installHash: await installSha256(),
           }));
+        }
+
+        // Public status: providers online and tokens served, with no account
+        // identity anywhere on the page. `/status` on the console host resolves
+        // here too, since anything on that host is a console path.
+        if (req.method === 'GET' && consolePath === '/status') {
+          return html(res, 200, await renderStatus({ registry, ledger }));
         }
 
         // Network-wide view: every host, account and consumer. Admins only — the

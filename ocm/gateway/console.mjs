@@ -31,6 +31,9 @@ export async function stats(registry, ledger) {
     runtime: h.caps.runtime || '—',
     models: [...h.models],
     inflight: h.inflight.size,
+    // Same evidence /v1/network publishes: will this host answer in about a second,
+    // or does it have to load a model first.
+    warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
     credited: led.creditedByHost[h.id] || 0,
   }));
@@ -142,7 +145,7 @@ claimed that the architecture cannot enforce.</footer>` : ''}</div></body></html
  */
 const nav = (email, admin = false) => `<nav>
   <div class="links"><strong>OCM</strong>
-    <a href="/">Overview</a><a href="/provider">Run a provider</a>${admin ? '<a href="/network">Network</a>' : ''}</div>
+    <a href="/">Overview</a><a href="/provider">Run a provider</a><a href="/status">Status</a>${admin ? '<a href="/network">Network</a>' : ''}</div>
   ${email ? `<div class="who"><span class="muted" title="${esc(email)}">${esc(email)}</span>
     <form method="post" action="/signout"><button class="ghost" style="margin:0;padding:6px 12px">Sign out</button></form></div>`
     : `<div class="who"><a class="muted" href="/">Sign in or create an account</a></div>`}</nav>`;
@@ -272,6 +275,66 @@ If your tool asks for a model we do not serve, such as <code>gpt-4o</code>, the 
 served by the network default rather than refused. The response tells you what actually
 ran, in the <code>model</code> field and an <code>x-ocm-served-model</code> header, so a
 substitution is never silent.</p>`);
+}
+
+/**
+ * Public status: the recruiting view a prospect can see without signing in.
+ * Hosts, chips, models, and tokens served — the same subset `/v1/network` already
+ * publishes, plus two aggregate counters. Deliberately absent: owners, account ids,
+ * balances, credentials, and any per-request log. `stats()` is not used here because
+ * it carries account ids on hosts and a per-consumer table; this page reads only what
+ * it will show.
+ */
+export async function renderStatus({ registry, ledger }) {
+  const [led, today] = await Promise.all([ledger.summary(), ledger.servedToday()]);
+  const hosts = registry.online().map((h) => ({
+    id: h.id,
+    chip: h.caps.chip || '—',
+    memory_gb: h.caps.memory_gb || 0,
+    region: h.caps.region || '—',
+    models: [...h.models],
+    inflight: h.inflight.size,
+    warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
+    uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
+  }));
+  const state = (h) => h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Warming up';
+  const models = registry.models();
+  const allTime = led.totals.prompt_tokens + led.totals.completion_tokens;
+  const todayTokens = today.prompt_tokens + today.completion_tokens;
+
+  const hostRows = hosts.map((h) => `<tr>
+    <td><span class="dot ${h.inflight || h.warm ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
+    <td>${state(h)}</td>
+    <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td><td>${esc(h.region)}</td>
+    <td>${esc(h.models.join(', ') || '—')}</td>
+    <td>${dur(h.uptime_s)}</td></tr>`).join('');
+
+  return page('OCM status', `${nav('')}
+<h1>Network status</h1>
+<p class="sub">Live. Idle Apple Silicon Macs behind one OpenAI-compatible API.</p>
+<div class="grid">
+  <div class="card"><div class="k">Providers online</div><div class="v">${hosts.length}</div></div>
+  <div class="card"><div class="k">Tokens served today</div><div class="v">${num(todayTokens)}</div></div>
+  <div class="card"><div class="k">Tokens served all time</div><div class="v">${num(allTime)}</div></div>
+  <div class="card"><div class="k">Requests today</div><div class="v">${num(today.requests)}</div></div>
+</div>
+
+<h2>Providers</h2>
+<div class="tablewrap">${hostRows ? `<table class="data">
+<thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th></tr></thead>
+<tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected right now.</div>'}</div>
+<p class="cap" style="margin-top:8px">Warming up means the machine is loading a model and will answer in about a
+minute; Ready and Serving answer in about a second.</p>
+
+<h2>Models</h2>
+<p>${models.length ? models.map((m) => `<code>${esc(m)}</code>`).join(' ') : '<span class="muted">None advertised.</span>'}</p>
+
+<h2>Take part</h2>
+<p>Have an Apple Silicon Mac that sits idle? <a href="/provider">Run a provider</a> and earn credits
+for the tokens it serves. To call the network, <a href="/">create an account</a> and use any
+OpenAI-compatible client unmodified.</p>
+<p class="muted">Counters reset at midnight UTC (today began ${esc(today.since.slice(0, 16).replace('T', ' '))} UTC).
+The same figures are available as JSON at <a href="/v1/network">/v1/network</a> on the API host.</p>`);
 }
 
 /** Admin-only: the whole network, with account emails. Never rendered to a non-admin. */
