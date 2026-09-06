@@ -100,7 +100,7 @@ test('the status page shows providers and totals and nothing about accounts', as
     assert.match(body, /Tokens served today<\/div><div class="v">155</);
     assert.match(body, /Tokens served all time<\/div><div class="v">2,155</);
     assert.match(body, /Requests today<\/div><div class="v">2</);
-    assert.match(body, /Warming up/, 'an idle host that has never served is warming');
+    assert.match(body, /Cold/, 'an idle host that has never loaded a model is cold, not warming');
     assert.match(body, /other-model/);
     assert.match(body, /href="\/provider"/);
 

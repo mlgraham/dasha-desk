@@ -300,7 +300,9 @@ export async function renderStatus({ registry, ledger }) {
     warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
     uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
   }));
-  const state = (h) => h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Warming up';
+  // An idle host that has not loaded a model is cold, not warming: nothing is
+  // happening until a request arrives, and then it takes about a minute.
+  const state = (h) => h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold';
   const models = registry.models();
   const allTime = led.totals.prompt_tokens + led.totals.completion_tokens;
   const todayTokens = today.prompt_tokens + today.completion_tokens;
@@ -326,8 +328,8 @@ export async function renderStatus({ registry, ledger }) {
 <div class="tablewrap">${hostRows ? `<table class="data">
 <thead><tr><th>Host</th><th>State</th><th>Chip</th><th>Memory</th><th>Region</th><th>Serving</th><th>Connected</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected right now.</div>'}</div>
-<p class="cap" style="margin-top:8px">Warming up means the machine is loading a model and will answer in about a
-minute; Ready and Serving answer in about a second.</p>
+<p class="cap" style="margin-top:8px">Cold means the machine will load its model on the first request and answer in
+about a minute; Ready and Serving answer in about a second.</p>
 
 <h2>Models</h2>
 <p>${models.length ? models.map((m) => `<code>${esc(m)}</code>`).join(' ') : '<span class="muted">None advertised.</span>'}</p>
@@ -351,7 +353,7 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
   const hostRows = s.hosts.map((h) => `<tr>
     <td><span class="dot ${h.inflight ? 'on' : 'off'}"></span><code>${esc(h.id)}</code></td>
     <td>${who(h.accountId)}</td>
-    <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Warming'}</td>
+    <td>${h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Cold'}</td>
     <td>${esc(h.chip)}</td><td>${h.memory_gb} GiB</td>
     <td>${esc(h.models.join(', ') || '—')}</td><td>${h.inflight}</td>
     <td>${dur(h.uptime_s)}</td><td>${num(h.credited)}</td></tr>`).join('');
@@ -413,7 +415,8 @@ export function renderProviderGuide({ account = null, apiHost, models, admin = f
 <li><b>You need no invite code at all.</b> Codes give API tokens to consumers; a provider earns by serving.</li>
 <li><b>You will see the prompts.</b> Anything routed to your machine is visible to you in plaintext, and the same is true of every other provider.</li>
 <li><b>It holds one model in memory,</b> about 4.5 GB, and downloads roughly the same on first use.</li>
-<li><b>Inference runs as your account,</b> never as root. Only the installer needs <code>sudo</code>.</li>
+<li><b>Inference runs as your account,</b> never as root. Only the installer needs <code>sudo</code>.
+  The other side of that: the token file is owned by your account, so anything running as you can read it.</li>
 </ul>
 
 <h2>Install</h2>
