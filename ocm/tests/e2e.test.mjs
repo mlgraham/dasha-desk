@@ -9,17 +9,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateway } from '../gateway/server.mjs';
 
-const HOST_TOKEN = 'host-test-token';
 const API_KEY = 'ocm_test_key';
 
 async function startGateway(opts = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ocm-'));
   const gw = await createGateway({
-    hostToken: HOST_TOKEN,
     keys: new Map([[API_KEY, 'test-dev']]),
     ledgerPath: join(dir, 'usage.jsonl'),
     grantTokens: 10_000,
@@ -28,9 +27,22 @@ async function startGateway(opts = {}) {
     modelAliases: '',
     ...opts,
   });
+  // No shared bootstrap token exists any more, so a stub host authenticates the way
+  // a real provider does: with an issued, account-bound credential.
+  return ready(gw);
+}
+
+/**
+ * Finish booting a gateway: listen, then issue the account-bound provider token a
+ * stub host needs. Shared by every factory so they cannot drift apart.
+ */
+function ready(gw) {
   return new Promise((resolve) => {
-    gw.server.listen(0, '127.0.0.1', () => {
-      resolve({ ...gw, base: `http://127.0.0.1:${gw.server.address().port}`,
+    gw.server.listen(0, '127.0.0.1', async () => {
+      const acct = await gw.accounts.createAccount('hosts@test.io');
+      const tok = await gw.accounts.issue(acct.id, 'provider_token', 'stub host');
+      resolve({ ...gw, hostToken: tok.secret, hostAccountId: acct.id,
+                base: `http://127.0.0.1:${gw.server.address().port}`,
                 wsBase: `ws://127.0.0.1:${gw.server.address().port}` });
     });
   });
@@ -40,9 +52,16 @@ async function startGateway(opts = {}) {
  * A stub host. `behaviour(job, api)` decides what this host does with a job,
  * which is how failure modes are exercised deterministically.
  */
-function connectHost(gw, { id, models = ['qwen3-8b'], behaviour }) {
+async function connectHost(gw, { id, models = ['qwen3-8b'], behaviour }) {
+  // One token per machine, because a provider token now binds to the first machine
+  // that presents it. Sharing one across stub hosts is exactly what the binding is
+  // designed to refuse, so the harness has to mirror how real providers are issued.
+  const cred = await gw.accounts.issue(gw.hostAccountId, 'provider_token', `stub ${id}`);
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${gw.wsBase}/host/connect?token=${HOST_TOKEN}`);
+    // Header, not a query string: the production agent does the same, so a token
+    // cannot reach a proxy access log.
+    const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+      { headers: { authorization: `Bearer ${cred.secret}` } });
     ws.addEventListener('error', reject);
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({
@@ -326,16 +345,11 @@ const admin = (gw, path, body) => fetch(`${gw.base}${path}`, {
 function startGatewayWithAdmin() {
   const dir = mkdtempSync(join(tmpdir(), 'ocm-'));
   return createGateway({
-    hostToken: HOST_TOKEN,
     adminToken: 'test-admin',
     keys: new Map([[API_KEY, 'test-dev']]),
     ledgerPath: join(dir, 'usage.jsonl'),
     grantTokens: 10_000,
-  }).then((gw) => new Promise((resolve) => {
-    gw.server.listen(0, '127.0.0.1', () => resolve({ ...gw,
-      base: `http://127.0.0.1:${gw.server.address().port}`,
-      wsBase: `ws://127.0.0.1:${gw.server.address().port}` }));
-  }));
+  }).then(ready);
 }
 
 test('admin routes require the admin token', async () => {
@@ -416,7 +430,8 @@ test('a valid developer key cannot open a provider socket, and the refusal is lo
     // The mistake this guards: putting a developer key in OCM_HOST_TOKEN. The key
     // is valid, so nothing about it looks wrong to whoever installed the agent.
     const rejected = await new Promise((resolve) => {
-      const ws = new WebSocket(`${gw.wsBase}/host/connect?token=${encodeURIComponent(key.secret)}`);
+      const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+        { headers: { authorization: `Bearer ${key.secret}` } });
       ws.addEventListener('error', () => resolve(true));
       ws.addEventListener('open', () => resolve(false));
     });
@@ -440,7 +455,8 @@ test('a host presenting an issued provider token connects; a bad one does not', 
     assert.match(tok.secret, /^ocm_host_/);
 
     await new Promise((resolve, reject) => {
-      const ws = new WebSocket(`${gw.wsBase}/host/connect?token=${encodeURIComponent(tok.secret)}`);
+      const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+        { headers: { authorization: `Bearer ${tok.secret}` } });
       ws.addEventListener('error', reject);
       ws.addEventListener('open', () => ws.send(JSON.stringify({
         t: 'hello', agent: { id: 'owned-host', models: ['qwen3-8b'] } })));
@@ -452,11 +468,21 @@ test('a host presenting an issued provider token connects; a bad one does not', 
       'the host must be bound to the issuing account');
 
     const rejected = await new Promise((resolve) => {
-      const ws = new WebSocket(`${gw.wsBase}/host/connect?token=ocm_host_not_a_real_token`);
+      const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+        { headers: { authorization: 'Bearer ocm_host_not_a_real_token' } });
       ws.addEventListener('error', () => resolve(true));
       ws.addEventListener('open', () => resolve(false));
     });
     assert.equal(rejected, true, 'an unissued provider token must be refused');
+
+    // Even a VALID token is refused in a query string: credentials belong in headers,
+    // and a URL is recorded by every proxy in the path.
+    const viaUrl = await new Promise((resolve) => {
+      const ws = new WebSocket(`${gw.wsBase}/host/connect?token=${encodeURIComponent(tok.secret)}`);
+      ws.addEventListener('error', () => resolve(true));
+      ws.addEventListener('open', () => resolve(false));
+    });
+    assert.equal(viaUrl, true, 'a valid token in a query string must still be refused');
   } finally { await gw.close(); }
 });
 
@@ -476,7 +502,8 @@ test('with no bootstrap credentials configured, nothing is accepted by default',
       assert.equal(res.status, 401, `well-known default "${key}" must not authorise`);
     }
     const rejected = await new Promise((resolve) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${gw.server.address().port}/host/connect?token=host-dev-token`);
+      const ws = new WebSocket(`ws://127.0.0.1:${gw.server.address().port}/host/connect`,
+        { headers: { authorization: 'Bearer host-dev-token' } });
       ws.addEventListener('error', () => resolve(true));
       ws.addEventListener('open', () => resolve(false));
     });
@@ -491,7 +518,6 @@ test('with no bootstrap credentials configured, nothing is accepted by default',
 function startConsole(opts = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ocm-'));
   return createGateway({
-    hostToken: HOST_TOKEN,
     inviteCode: 'potter',
     sessionSecret: 'test-session-secret',
     secureCookies: false,
@@ -499,11 +525,7 @@ function startConsole(opts = {}) {
     ledgerPath: join(dir, 'usage.jsonl'),
     grantTokens: 5_000,
     ...opts,
-  }).then((gw) => new Promise((resolve) => {
-    gw.server.listen(0, '127.0.0.1', () => resolve({ ...gw,
-      base: `http://127.0.0.1:${gw.server.address().port}`,
-      wsBase: `ws://127.0.0.1:${gw.server.address().port}` }));
-  }));
+  }).then(ready);
 }
 
 const form = (gw, path, fields, cookie) => fetch(`${gw.base}/console${path}`, {
@@ -511,6 +533,38 @@ const form = (gw, path, fields, cookie) => fetch(`${gw.base}/console${path}`, {
   headers: { 'content-type': 'application/x-www-form-urlencoded',
              ...(cookie ? { cookie } : {}) },
   body: new URLSearchParams(fields).toString(),
+});
+
+test('signup refuses an existing email and issues nothing (no takeover by address)', async () => {
+  const gw = await startConsole();
+  try {
+    // First signup: a real account and a real key exist for this email.
+    const first = await form(gw, '/signup', { email: 'owner@dev.io', invite: 'potter' });
+    assert.equal(first.status, 200);
+    const ownerKey = (await first.text()).match(/ocm_live_[A-Za-z0-9_-]+/)[0];
+
+    // An attacker who knows only the email tries to sign up as them.
+    const attack = await form(gw, '/signup', { email: 'owner@dev.io' });
+    assert.equal(attack.status, 302, 'a duplicate email must be refused, not served');
+    assert.equal(attack.headers.get('set-cookie'), null,
+      'no session cookie may be issued for an existing email');
+    assert.match(attack.headers.get('location'), /already/,
+      'the refusal must tell them to sign in');
+
+    // The attacker was handed no credential: a 302 carries no body and, asserted
+    // above, no cookie. And the owner's key still authenticates, so nothing about
+    // their account changed. Signin needs no provider, so this is host-independent.
+    const attackBody = await attack.text();
+    assert.doesNotMatch(attackBody, /ocm_live_/, 'no key may be returned to the attacker');
+    const ownerSignin = await form(gw, '/signin', { key: ownerKey });
+    assert.equal(ownerSignin.status, 302);
+    assert.ok(ownerSignin.headers.get('set-cookie'), "the owner's key still signs in");
+
+    // Case-insensitive: the email is lowercased, so a case variant is the same account.
+    const variant = await form(gw, '/signup', { email: 'OWNER@DEV.IO' });
+    assert.equal(variant.status, 302, 'email match must be case-insensitive');
+    assert.match(variant.headers.get('location'), /already/);
+  } finally { await gw.close(); }
 });
 
 test('signup works without a code, but the account starts at zero', async () => {
@@ -673,11 +727,112 @@ test('a signed-in account cannot revoke a credential it does not own', async () 
   } finally { await gw.close(); }
 });
 
-test('the provider guide is private and warns about plaintext prompts', async () => {
+test('a provider token binds to the first machine and refuses a second', async () => {
+  const gw = await startGatewayWithAdmin();
+  try {
+    const acct = await (await admin(gw, '/admin/accounts', { email: 'bind@r.o' })).json();
+    const tok = await (await admin(gw, '/admin/credentials',
+      { account_id: acct.id, kind: 'provider_token', label: 'the-mac' })).json();
+
+    const connect = (id) => new Promise((resolve) => {
+      const ws = new WebSocket(`${gw.wsBase}/host/connect`,
+        { headers: { authorization: `Bearer ${tok.secret}` } });
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      ws.addEventListener('error', () => done({ ok: false }));
+      ws.addEventListener('close', () => done({ ok: false }));
+      ws.addEventListener('open', () => ws.send(JSON.stringify({
+        t: 'hello', agent: { id, models: ['qwen3-8b'], chip: 'stub', memory_gb: 24 } })));
+      ws.addEventListener('message', (ev) => {
+        const m = JSON.parse(ev.data);
+        if (m.t === 'welcome') done({ ok: true, ws });
+        if (m.t === 'error') done({ ok: false, message: m.message });
+      });
+    });
+
+    const first = await connect('machine-one');
+    assert.equal(first.ok, true, 'the first machine claims the token');
+
+    // A different machine presenting the same token must be turned away, and told why.
+    const second = await connect('machine-two');
+    assert.equal(second.ok, false, 'a second machine must not be able to use it');
+    assert.match(second.message || '', /bound to machine-one/,
+      'the refusal must name the machine holding it, and how to fix it');
+    assert.match(second.message || '', /console/i);
+
+    // Releasing it lets a different machine claim it, so a rebuild is not a lockout.
+    assert.equal(await gw.accounts.rebind(tok.id, acct.id), true);
+    const third = await connect('machine-two');
+    assert.equal(third.ok, true, 'after release, another machine may claim it');
+    first.ws?.close(); third.ws?.close();
+  } finally { await gw.close(); }
+});
+
+test('an unknown model falls back to the default and the response says so', async () => {
+  const gw = await startGateway({ defaultModel: 'qwen3-8b' });
+  try {
+    await connectHost(gw, { id: 'fallback-host', behaviour: echoHost });
+
+    // What an unmodified OpenAI client actually sends.
+    const res = await post(gw, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200, 'an unmodified client must not get a 503');
+
+    // The disclosure is the whole basis for doing this at all.
+    assert.equal(res.headers.get('x-ocm-served-model'), 'qwen3-8b',
+      'the header must name what actually served');
+    const body = await res.json();
+    assert.equal(body.model, 'qwen3-8b',
+      'the response model must be what served, never an echo of the request');
+
+    // A model we DO serve is untouched, and gets no substitution header.
+    const direct = await post(gw, ask());
+    assert.equal(direct.status, 200);
+    assert.equal(direct.headers.get('x-ocm-served-model'), null,
+      'no substitution means no header');
+    assert.equal((await direct.json()).model, 'qwen3-8b');
+  } finally { await gw.close(); }
+});
+
+test('with no default configured, an unknown model is refused with what is available', async () => {
+  const gw = await startGateway({ defaultModel: '' });
+  try {
+    await connectHost(gw, { id: 'strict-host', behaviour: echoHost });
+    const res = await post(gw, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 503);
+    const msg = (await res.json()).error.message;
+    assert.match(msg, /gpt-4o/, 'the error names what was asked for');
+    assert.match(msg, /Available: qwen3-8b/, 'and what could be asked for instead');
+  } finally { await gw.close(); }
+});
+
+test('a host reports whether it is warm, so loading is not mistaken for broken', async () => {
+  const gw = await startGateway();
+  try {
+    await connectHost(gw, { id: 'warm-probe', behaviour: echoHost });
+    // Freshly connected: no tokens produced yet, so not warm.
+    let net = await (await fetch(`${gw.base}/v1/network`)).json();
+    assert.equal(net.hosts[0].warm, false, 'a host that has served nothing is not warm');
+
+    await (await post(gw, ask())).json();
+    net = await (await fetch(`${gw.base}/v1/network`)).json();
+    assert.equal(net.hosts[0].warm, true, 'producing tokens marks the host warm');
+
+    // The public view must still carry no account identity.
+    assert.ok(!('accountId' in net.hosts[0]), '/v1/network must not expose ownership');
+  } finally { await gw.close(); }
+});
+
+test('the provider guide is public and warns about plaintext prompts', async () => {
   const gw = await startConsole();
   try {
-    const anon = await fetch(`${gw.base}/console/provider`, { redirect: 'manual' });
-    assert.equal(anon.status, 302, 'the guide must require sign-in');
+    // The guide is deliberately public: it is the link prospects are sent, and it
+    // carries no account data. It used to 302 to an unexplained login wall.
+    const anon = await fetch(`${gw.base}/console/provider`);
+    assert.equal(anon.status, 200, 'the recruiting guide must be readable signed out');
+    const anonHtml = await anon.text();
+    assert.doesNotMatch(anonHtml, /Sign out/, 'a signed-out visitor gets no account chrome');
+    assert.match(anonHtml, /no invite code/i,
+      'a signed-out provider must be told they need no invite code');
 
     const s = await form(gw, '/signup', { email: 'p@dev.io', invite: 'potter' });
     const cookie = s.headers.get('set-cookie').split(';')[0];
@@ -693,14 +848,19 @@ test('the provider guide is private and warns about plaintext prompts', async ()
       'the guide must distinguish the two credentials');
     assert.match(html, /ocm-agent-token/,
       'the guide must give a supported way to rotate a token');
+    // A credential passed as an argument is visible via ps and kept in shell history.
+    assert.match(html, /sudo \/opt\/ocm\/bin\/ocm-agent-token<\/code>/,
+      'the documented rotation must be the bare helper, which prompts; never an argument');
+    assert.match(html, /will not accept a token as a command-line argument/i,
+      'the guide must say why');
     assert.match(html, /Do not edit/i,
       'the guide must warn against hand-editing the run wrapper');
     assert.match(html, /OCM_AGENT_ID/,
       'the guide must name the identity variable, or a reinstall silently registers a second host');
-    assert.match(html, /read -rsp/,
-      'the human install path must prompt without echo');
-    assert.match(html, /--preserve-env=OCM_HOST_TOKEN/,
-      'sudo must inherit the prompted token from the environment, not from argv');
+    assert.match(html, /sudo OCM_AGENT_ID="my-mac" sh install.sh/,
+      'the human install path is one line with no token on it');
+    assert.match(html, /typing hidden/,
+      'the guide must say the installer prompts for the token without echo');
     assert.doesNotMatch(html, /OCM_HOST_TOKEN=["']ocm_host_/,
       'the guide must not teach a copy-paste command that puts the token on argv');
   } finally { await gw.close(); }
@@ -890,6 +1050,69 @@ test('the installer generates a run wrapper that forwards its arguments', () => 
     '--doctor must reach the agent unquoted');
   assert.doesNotMatch(run(''), /agent\.py \S/,
     'no arguments must mean no arguments');
+
+  // `umask 077` is set earlier for the token file and stays in effect, so a bare
+  // `chmod +x` leaves these helpers root-only. Neither holds a secret, and 700 blocks
+  // the owner from reading back what was installed — the verification we ask for.
+  assert.match(src, /chmod 755 "\$PREFIX\/bin\/ocm-agent-run"/,
+    'the run wrapper must be readable, not 700');
+  assert.match(src, /chmod 755 "\$PREFIX\/bin\/ocm-agent-token"/,
+    'the rotation helper must be readable too');
+  assert.match(src, /chmod 600 \/etc\/ocm\/agent\.env/,
+    'the token file itself must stay root-only');
+});
+
+test('the installer hash is published and matches the bytes served', async () => {
+  const gw = await startGateway();
+  try {
+    const res = await fetch(`${gw.base}/install.sh.sha256`);
+    assert.equal(res.status, 200);
+    const [hex, name] = (await res.text()).trim().split(/\s+/);
+    assert.match(hex, /^[0-9a-f]{64}$/, 'a sha256 hex digest');
+    assert.equal(name, 'install.sh', 'shasum -c parseable');
+
+    // The published hash must be of the file actually served, not a build artifact
+    // that can drift from it.
+    const script = await (await fetch(`${gw.base}/install.sh`)).text();
+    const actual = createHash('sha256').update(script).digest('hex');
+    assert.equal(hex, actual, 'the published hash must match the served installer');
+  } finally { await gw.close(); }
+});
+
+test('onboarding copy states the facts that stopped providers', async () => {
+  const gw = await startConsole();
+  try {
+    // Signed out: the recruiting page carries the credit facts and the agent block.
+    const guide = await (await fetch(`${gw.base}/console/provider`)).text();
+    assert.match(guide, /not money/i, 'credits must be defined honestly');
+    assert.match(guide, /up to about 90\s*seconds|~90s/i, 'cold start must be documented');
+    assert.match(guide, /Setting this up with an AI agent/i, 'the agent block must be present');
+    assert.match(guide, /brew install uv/, 'the root-shell-free path must be offered');
+
+    // Prose tables must wrap. A blanket td{white-space:nowrap} once forced a whole
+    // paragraph onto one line, giving that column a ~1400px width on a 390px phone,
+    // which is what triggered iOS to inflate its text out of proportion.
+    // The intent, not a count: any table on this page carries prose and must wrap.
+    // A blanket nowrap once forced a paragraph onto one line, giving that column a
+    // ~1400px width on a 390px phone and triggering iOS to inflate its text.
+    const proseTables = guide.match(/<div class="tablewrap"><table>/g) || [];
+    assert.ok(proseTables.length >= 1, 'the guide should still have a prose table');
+    assert.doesNotMatch(guide, /<div class="tablewrap"><table class="data">/,
+      'prose tables must not be marked as data tables');
+    assert.doesNotMatch(guide, /agent yields when you need the GPU/,
+      'the unimplemented yielding claim must be gone');
+
+    // Signup: the first screen everyone sees must not imply providers are blocked.
+    const up = await form(gw, '/signup', { email: 'prov@dev.io' });
+    const upHtml = await up.text();
+    assert.match(upHtml, /needs no invite code/i,
+      'the post-signup page must tell a provider they need no code');
+
+    // The zero-balance banner says the same.
+    const cookie = up.headers.get('set-cookie').split(';')[0];
+    const home = await (await fetch(`${gw.base}/console`, { headers: { cookie } })).text();
+    assert.match(home, /does not affect running a provider/i);
+  } finally { await gw.close(); }
 });
 
 test('the gateway serves the agent and installer it expects', async () => {

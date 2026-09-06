@@ -15,6 +15,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 node --check "$ROOT/gateway/server.mjs"
 node --test "$ROOT"/tests/*.test.mjs >/dev/null || { echo "tests failed — not deploying"; exit 1; }
 
+# The agent ships with the gateway, and a broken agent.py is invisible to the Node
+# suite. A missing module-level import once shipped this way and crash-looped the
+# provider: syntax was valid, and the failing constructor only runs on Apple Silicon.
+if command -v uv >/dev/null 2>&1; then
+  uv run --quiet --python 3.12 --with websockets python "$ROOT/tests/agent-smoke.py" \
+    || { echo "agent smoke failed — not deploying"; exit 1; }
+else
+  echo "WARNING: uv not found, agent smoke test SKIPPED. The agent is shipping unverified." >&2
+fi
+
 tar -czf /tmp/ocm-gateway.tar.gz -C "$ROOT" gateway agent package.json
 aws s3 cp /tmp/ocm-gateway.tar.gz "s3://$BUCKET/gateway/ocm-gateway.tar.gz" --only-show-errors
 

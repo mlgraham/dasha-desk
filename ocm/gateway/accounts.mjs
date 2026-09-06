@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 CREATE INDEX IF NOT EXISTS credentials_hash_idx    ON credentials (hash) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS credentials_account_idx ON credentials (account_id);
+-- A provider token binds to the first machine that presents it, so a leaked token
+-- cannot be used from somewhere else and per-machine revocation means what an
+-- operator assumes it means. Added later, hence the ALTER for existing databases.
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS bound_agent_id text;
 `;
 
 /**
@@ -129,7 +133,7 @@ export class PgAccounts {
 
   async listCredentials(accountId) {
     const { rows } = await this.pool.query(
-      `SELECT id, kind, label, created_at, last_used_at, revoked_at
+      `SELECT id, kind, label, created_at, last_used_at, revoked_at, bound_agent_id
          FROM credentials WHERE account_id = $1 ORDER BY created_at DESC`, [accountId]);
     return rows;
   }
@@ -137,6 +141,41 @@ export class PgAccounts {
   async accountFor(accountId) {
     const { rows } = await this.pool.query(`SELECT id, email FROM accounts WHERE id = $1`, [accountId]);
     return rows[0] || null;
+  }
+
+  /** Existing account for this email, or null. Signup uses it to refuse a duplicate. */
+  async accountByEmail(email) {
+    const { rows } = await this.pool.query(
+      `SELECT id, email FROM accounts WHERE email = $1`, [String(email || '').toLowerCase()]);
+    return rows[0] || null;
+  }
+
+  /**
+   * Claim this credential for a machine, or report the conflict.
+   *
+   * Returns {ok:true} when the token is unbound (first use, now bound) or already
+   * bound to this same agent. Returns {ok:false, boundTo} when it belongs to a
+   * different machine. The bind is conditional in SQL so two hosts racing the same
+   * unbound token cannot both win.
+   */
+  async claimAgent(credentialId, agentId) {
+    if (!credentialId || !agentId) return { ok: true };
+    const { rows } = await this.pool.query(
+      `UPDATE credentials SET bound_agent_id = $2
+         WHERE id = $1 AND (bound_agent_id IS NULL OR bound_agent_id = $2)
+       RETURNING bound_agent_id`, [credentialId, agentId]);
+    if (rows.length) return { ok: true, bound: rows[0].bound_agent_id };
+    const cur = await this.pool.query(
+      `SELECT bound_agent_id FROM credentials WHERE id = $1`, [credentialId]);
+    return { ok: false, boundTo: cur.rows[0] ? cur.rows[0].bound_agent_id : null };
+  }
+
+  /** Release the binding so the token can be moved to another machine. */
+  async rebind(credentialId, accountId) {
+    const { rowCount } = await this.pool.query(
+      `UPDATE credentials SET bound_agent_id = NULL
+        WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL`, [credentialId, accountId]);
+    return rowCount > 0;
   }
 
   /** Every account, oldest first — for the admin network view only. */
@@ -203,12 +242,36 @@ export class MemoryAccounts {
     return !!c && !c.revoked_at;
   }
 
+  async claimAgent(credentialId, agentId) {
+    if (!credentialId || !agentId) return { ok: true };
+    const c = this.creds.get(credentialId);
+    if (!c) return { ok: true };
+    if (!c.bound_agent_id || c.bound_agent_id === agentId) {
+      c.bound_agent_id = agentId;
+      return { ok: true, bound: agentId };
+    }
+    return { ok: false, boundTo: c.bound_agent_id };
+  }
+
+  async rebind(credentialId, accountId) {
+    const c = this.creds.get(credentialId);
+    if (!c || c.account_id !== accountId || c.revoked_at) return false;
+    c.bound_agent_id = null;
+    return true;
+  }
+
   async listCredentials(accountId) {
     return [...this.creds.values()].filter((c) => c.account_id === accountId)
       .map(({ hash, ...rest }) => rest);
   }
 
   async accountFor(accountId) { return this.accounts.get(accountId) || null; }
+
+  async accountByEmail(email) {
+    const lower = String(email || '').toLowerCase();
+    for (const a of this.accounts.values()) if (a.email === lower) return a;
+    return null;
+  }
 
   async listAccounts() {
     return [...this.accounts.values()].map((a) => {

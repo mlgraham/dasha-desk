@@ -1,9 +1,9 @@
 #!/bin/sh
 # OCM provider installer for macOS (Apple Silicon).
 #
-# Read this before running it. It is short on purpose: piping an unread script into
-# a shell is a bad habit, and the owners worth recruiting first are the ones who
-# would rather look.
+# Read this before running it: piping an unread script into a shell is a bad habit.
+# It is about 190 lines. The two parts worth your attention are the token check at the
+# top, which runs before anything is written, and the launchd handling at the end.
 #
 # What it does:
 #   1. refuses to run on anything but Apple Silicon macOS
@@ -206,6 +206,10 @@ export HOME="$RUN_HOME"
 set -a; . /etc/ocm/agent.env; set +a
 exec "$UV" run --quiet --python 3.12 $PREFIX/agent/agent.py "\$@"
 RUN
+# 755, not the 700 that `umask 077` above would otherwise leave. This file holds no
+# secret — the token lives in /etc/ocm/agent.env — so root-only mode protects nothing
+# and blocks the owner (or their agent) from reading back what was just installed,
+# which is exactly the verification this script asks people to perform.
 chmod 755 "$PREFIX/bin/ocm-agent-run"
 
 # Rotating a token had no supported path, so people edited ocm-agent-run by hand —
@@ -280,7 +284,7 @@ launchctl kickstart -k system/com.ocm.agent
 echo "token accepted, written, and agent restarted."
 echo "watch it connect:  tail -f /var/log/ocm-agent.log"
 TOK
-chmod 755 "$PREFIX/bin/ocm-agent-token"
+chmod 755 "$PREFIX/bin/ocm-agent-token"   # readable for the same reason
 
 # launchd opens the log as RUN_USER. Pre-create it owner-only rather than relying on
 # launchd to create a world-readable root log or failing because /var/log is closed.

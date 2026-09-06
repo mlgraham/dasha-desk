@@ -10,10 +10,10 @@
  * failover before first token, and gateway-side metering.
  */
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
 import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret } from './console.mjs';
@@ -75,6 +75,27 @@ const MAX_INFLIGHT_PER_HOST = 2;
 // The agent and its installer are served from the gateway so a provider fetches
 // exactly the code this deployment expects, rather than a version drifting in a repo.
 const AGENT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'agent');
+/**
+ * SHA-256 of the installer we are actually serving, computed from the bytes on disk
+ * rather than a build artifact, so the published hash cannot drift from the file.
+ * Cached by mtime: the file only changes on deploy.
+ */
+let _installHash = null;
+async function installSha256() {
+  try {
+    const path = join(AGENT_DIR, 'install.sh');
+    const { mtimeMs, size } = await stat(path);
+    if (_installHash && _installHash.mtimeMs === mtimeMs && _installHash.size === size) {
+      return _installHash.hex;
+    }
+    const hex = createHash('sha256').update(await readFile(path)).digest('hex');
+    _installHash = { mtimeMs, size, hex };
+    return hex;
+  } catch {
+    return null;   // never let a missing file take the page down
+  }
+}
+
 const DOWNLOADS = {
   '/agent.py': { file: 'agent.py', type: 'text/x-python; charset=utf-8' },
   '/install.sh': { file: 'install.sh', type: 'text/x-shellscript; charset=utf-8' },
@@ -234,20 +255,6 @@ const readBody = (req, limit = 2 * 1024 * 1024) => new Promise((resolve, reject)
 });
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
-const isLoopbackAddress = (address) =>
-  address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-
-/**
- * Header auth is the production path. Query auth exists only for old local tests and
- * cannot be enabled by a forwarded header: the actual TCP peer must be loopback.
- */
-export function providerSocketCredential(req, url) {
-  const header = bearer(req);
-  if (header) return header;
-  return isLoopbackAddress(req.socket?.remoteAddress)
-    ? (url.searchParams.get('token') || '')
-    : '';
-}
 
 /** Public health must never echo a database hostname, user, path, or driver error. */
 export function publicAccountingHealth(ledger) {
@@ -264,12 +271,15 @@ export async function createGateway({
   // empty means nobody, which is the safe default for a page that lists every user.
   adminEmails = process.env.OCM_ADMIN_EMAILS || '',
   modelAliases = process.env.OCM_MODEL_ALIASES ?? DEFAULT_MODEL_ALIASES,
+  // A tool pointed at us with only the two env vars sends its own model string
+  // ('gpt-4o', 'claude-...'), which we do not serve, and got a 503. That defeats
+  // "works unmodified", which is the distribution strategy. Unknown names now fall
+  // back to this, and the response says what actually served so the substitution is
+  // never silent. Set to '' to restore strict matching.
+  defaultModel = process.env.OCM_DEFAULT_MODEL ?? 'ocm-coder',
   databaseUrl = process.env.DATABASE_URL || '',
   consoleHost = process.env.OCM_CONSOLE_HOST || 'ocm.getdasha.com',
   apiHost = process.env.OCM_API_HOST || 'api.ocm.getdasha.com',
-  // No default. An unset bootstrap token must DISABLE the shared-token path, not
-  // fall back to a well-known string that anyone could present.
-  hostToken = process.env.OCM_HOST_TOKEN || '',
   keys = null,
   ledgerPath = 'ocm/.data/usage.jsonl',
   grantTokens = Number(process.env.OCM_GRANT_TOKENS || 1_000_000),
@@ -304,7 +314,8 @@ export async function createGateway({
   const sockets = new Set();   // every live host socket, registered or not
 
   // Bootstrap developer key, for first-run only. Empty unless explicitly set, for
-  // the same reason as hostToken: real callers hold issued, revocable account keys.
+  // the same reason the shared host token was removed: real callers hold issued,
+  // revocable, account-bound credentials.
   const consumers = keys
     || (process.env.OCM_API_KEY ? new Map([[process.env.OCM_API_KEY, 'dev']]) : new Map());
   for (const consumer of new Set(consumers.values())) {
@@ -365,8 +376,12 @@ export async function createGateway({
         }
 
         if (req.method === 'GET' && consolePath === '/provider') {
-          if (!account) return redirect(res, '/');
-          return html(res, 200, renderProviderGuide({ account, apiHost, models: registry.models(), admin: isAdmin(account) }));
+          // Readable signed out on purpose: it is the link prospects are sent, it
+          // contains no account data, and it is the best recruiting asset we have.
+          return html(res, 200, renderProviderGuide({
+            account, apiHost, models: registry.models(), admin: isAdmin(account),
+            installHash: await installSha256(),
+          }));
         }
 
         // Network-wide view: every host, account and consumer. Admins only — the
@@ -380,6 +395,16 @@ export async function createGateway({
         if (req.method === 'POST' && consolePath === '/signup') {
           const f = parseForm(await readBody(req));
           if (!f.email) return redirect(res, '/?error=' + encodeURIComponent('An email address is required.'));
+          // Signup must NEVER authenticate an existing email. Accounts are keyed by
+          // email, so without this an unauthenticated visitor who types someone
+          // else's address is handed a live session and a working key on that
+          // account — takeover by address alone. An existing email is turned away
+          // here, before any credential is issued or cookie set; recovering access
+          // requires the account's developer key (or, later, an emailed link).
+          if (await accounts.accountByEmail(f.email)) {
+            return redirect(res, '/?error=' + encodeURIComponent(
+              'An account with that email already exists. Sign in with your developer key.'));
+          }
           // Signup is open. The invite code buys TOKENS, not entry — a wrong code is
           // still refused outright, because silently creating a useless account
           // would leave someone wondering why nothing works.
@@ -412,8 +437,11 @@ export OPENAI_API_KEY="${cred.secret}"</pre>
 ${granted
   ? `<p class="muted">You have ${grantTokens.toLocaleString('en-US')} granted tokens. These are credits, not money.</p>`
   : `<div class="note warn"><strong>Your balance is zero.</strong> The account exists and
-     the key is valid, but requests will be refused until you redeem an invite code —
-     you can do that from the console at any time.</div>`}`,
+     the key is valid, but API requests will be refused until you redeem an invite code —
+     you can do that from the console at any time.</div>`}
+<div class="note"><strong>Want to contribute a Mac instead?</strong> Running a provider
+needs no invite code: your machine earns credits as it serves. See
+<a href="/provider">Run a provider</a>.</div>`,
           }));
         }
 
@@ -480,6 +508,16 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           }));
         }
 
+        if (req.method === 'POST' && consolePath === '/keys/rebind') {
+          if (!account) return redirect(res, '/');
+          const f = parseForm(await readBody(req));
+          // Scoped to the signed-in account, so one person cannot free another's token.
+          const ok = await accounts.rebind(f.credential_id, account.id);
+          return redirect(res, '/?notice=' + encodeURIComponent(ok
+            ? 'Token released. The next machine to present it will claim it.'
+            : 'That credential could not be released.'));
+        }
+
         if (req.method === 'POST' && consolePath === '/keys/revoke') {
           if (!account) return redirect(res, '/');
           const f = parseForm(await readBody(req));
@@ -523,6 +561,16 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           return json(res, 200, { revoked: await accounts.revoke(body.credential_id) });
         }
         return apiError(res, 404, `no admin route for ${req.method} ${url.pathname}`);
+      }
+      if (req.method === 'GET' && url.pathname === '/install.sh.sha256') {
+        const hash = await installSha256();
+        if (!hash) return apiError(res, 404, 'installer not available');
+        // `shasum -a 256` output shape, so it can be piped straight into `shasum -c`.
+        const body = `${hash}  install.sh\n`;
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8',
+                             'cache-control': 'no-cache',
+                             'content-length': Buffer.byteLength(body) });
+        return res.end(body);
       }
       if (req.method === 'GET' && DOWNLOADS[url.pathname]) {
         const { file, type } = DOWNLOADS[url.pathname];
@@ -577,6 +625,9 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           hosts: registry.online().map((h) => ({
             id: h.id, chip: h.caps.chip, memory_gb: h.caps.memory_gb,
             region: h.caps.region, models: [...h.models],
+            // Public, and carries no account identity: whether this host will answer
+            // in about a second or has to load a model first.
+            warm: [...h.warm.keys()].some((m) => registry.isWarm(h, m)),
             inflight: h.inflight.size, uptime_s: Math.round((Date.now() - h.connectedAt) / 1000),
           })),
           models: registry.models(),
@@ -622,6 +673,15 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
     if (!model) return apiError(res, 400, 'model is required');
     if (!Array.isArray(messages) || !messages.length) return apiError(res, 400, 'messages must be a non-empty array');
 
+    // Resolve what will actually serve this request. Asking for something we have is
+    // unchanged; asking for something we do not falls back, and is disclosed below.
+    let served = model;
+    let substituted = false;
+    if (!registry.pick(model) && defaultModel && registry.pick(defaultModel)) {
+      served = defaultModel;
+      substituted = true;
+    }
+
     const promptTokens = countTokens(messages.map((m) => m?.content || '').join('\n'));
     const jobId = randomUUID();
     const created = Math.floor(Date.now() / 1000);
@@ -631,14 +691,19 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
     // Failover applies only before the first token: once bytes have shipped the
     // client has a partial answer and re-running would duplicate it (PDF §03).
     for (let attempt = 0; attempt < MAX_ROUTE_ATTEMPTS; attempt++) {
-      const host = registry.pick(model, tried);
+      const host = registry.pick(served, tried);
       if (!host) {
+        const available = registry.models();
         return apiError(res, 503, tried.size
-          ? `no healthy host for model ${model} after ${tried.size} attempt(s)`
-          : `no host currently serving model ${model}`, 'service_unavailable');
+          ? `no healthy host for model ${served} after ${tried.size} attempt(s)`
+          : `no host currently serving model ${model}. Available: ${available.join(', ') || 'none'}`,
+          'service_unavailable');
       }
       tried.add(host.id);
-      const outcome = await runJob({ host, jobId, model, messages, stream, res, chatId, created, consumer, promptTokens });
+      // The response carries the model that served, never an echo of the request.
+      // Silent substitution is the fastest way to become untrustworthy.
+      if (substituted && !res.headersSent) res.setHeader('x-ocm-served-model', served);
+      const outcome = await runJob({ host, jobId, model: served, messages, stream, res, chatId, created, consumer, promptTokens });
       if (outcome.ok || outcome.committed || outcome.aborted || res.destroyed || res.writableEnded) return;
       // else: nothing was delivered to the client — safe to try another host
     }
@@ -807,11 +872,16 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
   server.on('upgrade', async (req, socket) => {
     const url = new URL(req.url, 'http://gateway');
     if (url.pathname !== '/host/connect') { socket.destroy(); return; }
-    const presented = providerSocketCredential(req, url);
-    // Account-bound provider token first; the shared bootstrap token still works
-    // so existing hosts keep running during migration.
+    // Header only. The query-string fallback existed so hosts running the pre-header
+    // agent kept working during the migration; both live hosts are updated, so it is
+    // gone. A credential in a URL is recorded verbatim by every proxy in the path.
+    const presented = bearer(req);
+    // Account-bound provider tokens only. The shared bootstrap token this used to
+    // accept was a static credential that let any machine join; it was disabled in
+    // production by stripping its env var, which is a deployment detail standing in
+    // for a code guarantee. Now there is no such path to re-enable by accident.
     const owner = await accounts.resolve(presented, 'provider_token');
-    if (!owner && !(hostToken && presented === hostToken)) {
+    if (!owner) {
       // A rejected provider was previously invisible here: the socket was closed
       // with no record, so "my Mac will not connect" had no server-side evidence
       // at all. Log the token's SHAPE — never the token — which is enough to tell
@@ -828,8 +898,8 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
       socket.destroy();
       return;
     }
-    const accountId = owner ? owner.accountId : null;
-    const credentialId = owner ? owner.credentialId : null;
+    const accountId = owner.accountId;
+    const credentialId = owner.credentialId;
     const conn = accept(req, socket);
     if (!conn) return;
     sockets.add(conn);
@@ -853,15 +923,35 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
           conn.close(1008, 'invalid provider capabilities');
           return;
         }
-        const registration = registry.add(agent.id, conn, { ...agent, accountId }, credentialId);
-        if (!registration.ok) {
-          console.error(JSON.stringify({ level: 'warn', msg: 'provider identity collision',
-            accountId, hostId: agent.id }));
-          conn.close(1008, 'provider id already in use');
-          return;
-        }
-        hostId = agent.id;
-        conn.sendJson({ t: 'welcome', host_id: hostId, heartbeat_ms: HEARTBEAT_MS });
+        // A provider token binds to the first machine that presents it. Before this,
+        // any token worked from any machine under any name, two machines could share
+        // one undetected, and revoking "the token for that Mac" was convention only.
+        // The agent id only arrives with hello, so this cannot happen at the upgrade.
+        // The binding is persisted on the credential; the registry's account check
+        // below is the in-memory half (one id cannot be taken by another account).
+        Promise.resolve(accounts.claimAgent(credentialId, agent.id))
+          .then((claim) => {
+            if (conn.closed) return;
+            if (!claim.ok) {
+              console.error(JSON.stringify({ level: 'warn', msg: 'provider socket refused: token bound elsewhere',
+                accountId, presented_as: agent.id, bound_to: claim.boundTo }));
+              conn.sendJson({ t: 'error', message:
+                `this provider token is bound to ${claim.boundTo}. Rebind it in the console ` +
+                `under Credentials, or issue a token for this machine.` });
+              conn.close(1008, 'token bound to another machine');
+              return;
+            }
+            const registration = registry.add(agent.id, conn, { ...agent, accountId }, credentialId);
+            if (!registration.ok) {
+              console.error(JSON.stringify({ level: 'warn', msg: 'provider identity collision',
+                accountId, hostId: agent.id }));
+              conn.close(1008, 'provider id already in use');
+              return;
+            }
+            hostId = agent.id;
+            conn.sendJson({ t: 'welcome', host_id: hostId, heartbeat_ms: HEARTBEAT_MS });
+          })
+          .catch((e) => { console.error('claimAgent', e); conn.close(1011, 'internal'); });
         return;
       }
 
