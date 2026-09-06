@@ -15,7 +15,6 @@ import { Ledger } from '../gateway/ledger.mjs';
 import {
   createGateway,
   parseAliases,
-  providerSocketCredential,
   publicAccountingHealth,
 } from '../gateway/server.mjs';
 
@@ -42,7 +41,8 @@ async function listen(gateway) {
 
 function connectHost(wsBase, token, id, models, onJob = () => {}) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${wsBase}/host/connect?token=${encodeURIComponent(token)}`);
+    const socket = new WebSocket(`${wsBase}/host/connect`,
+      { headers: { authorization: `Bearer ${token}` } });
     socket.addEventListener('error', reject);
     socket.addEventListener('open', () => socket.send(JSON.stringify({
       t: 'hello', agent: { id, models },
@@ -90,16 +90,26 @@ test('the MLX agent imports successfully and never puts its credential in the UR
   });
 });
 
-test('production provider socket auth refuses URL credentials', () => {
-  const withQuery = new URL('ws://gateway/host/connect?token=query-secret');
-  assert.equal(providerSocketCredential({ headers: {}, socket: { remoteAddress: '10.0.1.9' } }, withQuery), '',
-    'a non-loopback peer must never authenticate from the URL');
-  assert.equal(providerSocketCredential({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }, withQuery),
-    'query-secret', 'legacy query auth is limited to the actual loopback TCP peer');
-  assert.equal(providerSocketCredential({
-    headers: { authorization: 'Bearer header-secret' },
-    socket: { remoteAddress: '10.0.1.9' },
-  }, withQuery), 'header-secret', 'Authorization must be the production credential path');
+test('production provider socket auth refuses URL credentials', async () => {
+  // There is no loopback exception any more: a credential in a URL is recorded by
+  // every proxy in the path, so the gateway reads it from the Authorization header
+  // and nowhere else. A VALID token in the query string is refused, even from the
+  // actual loopback TCP peer.
+  const dir = mkdtempSync(join(tmpdir(), 'ocm-socket-auth-'));
+  const gw = await createGateway({ ledgerPath: join(dir, 'usage.jsonl'), keys: new Map() });
+  const { ws: wsBase } = await listen(gw);
+  try {
+    const account = await gw.accounts.createAccount('socket-auth@test.dev');
+    const token = await gw.accounts.issue(account.id, 'provider_token', 'test');
+    const refused = await new Promise((resolve) => {
+      const socket = new WebSocket(`${wsBase}/host/connect?token=${encodeURIComponent(token.secret)}`);
+      socket.addEventListener('error', () => resolve(true));
+      socket.addEventListener('open', () => resolve(false));
+    });
+    assert.equal(refused, true, 'a valid token in a query string must be refused on loopback');
+    const socket = await connectHost(wsBase, token.secret, 'header-host', ['m']);
+    socket.close();
+  } finally { await gw.close(); }
 });
 
 test('public health exposes accounting state without leaking its internal error', () => {
@@ -135,10 +145,8 @@ test('model aliases reject blank and ambiguous reverse mappings', () => {
 
 test('duplicate and conflicting terminal messages clear one usage row', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ocm-terminal-race-'));
-  const hostToken = 'host-race-token';
   const apiKey = 'ocm_race_key';
   const gw = await createGateway({
-    hostToken,
     keys: new Map([[apiKey, 'race-consumer']]),
     ledgerPath: join(dir, 'usage.jsonl'),
     grantTokens: 1_000,
@@ -147,7 +155,9 @@ test('duplicate and conflicting terminal messages clear one usage row', async ()
   const { base, ws } = await listen(gw);
   let socket;
   try {
-    socket = await connectHost(ws, hostToken, 'racy-host', ['race-model'], (message, host) => {
+    const provider = await gw.accounts.createAccount('race-provider@test.dev');
+    const racyToken = await gw.accounts.issue(provider.id, 'provider_token', 'racy-host');
+    socket = await connectHost(ws, racyToken.secret, 'racy-host', ['race-model'], (message, host) => {
       host.send(JSON.stringify({ t: 'chunk', id: message.id, delta: 'abcd' }));
       host.send(JSON.stringify({ t: 'done', id: message.id }));
       host.send(JSON.stringify({ t: 'error', id: message.id, message: 'late error' }));
@@ -173,10 +183,8 @@ test('duplicate and conflicting terminal messages clear one usage row', async ()
 
 test('a client abort before first token never dispatches a failover job', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ocm-client-abort-'));
-  const hostToken = 'host-abort-token';
   const apiKey = 'ocm_abort_key';
   const gw = await createGateway({
-    hostToken,
     keys: new Map([[apiKey, 'abort-consumer']]),
     ledgerPath: join(dir, 'usage.jsonl'),
     grantTokens: 1_000,
@@ -191,7 +199,10 @@ test('a client abort before first token never dispatches a failover job', async 
   const dispatched = new Promise((resolve) => { dispatchedResolve = resolve; });
 
   try {
-    first = await connectHost(ws, hostToken, 'hanging-host', ['abort-model'], () => {
+    const provider = await gw.accounts.createAccount('abort-provider@test.dev');
+    const hangingToken = await gw.accounts.issue(provider.id, 'provider_token', 'hanging-host');
+    const backupToken = await gw.accounts.issue(provider.id, 'provider_token', 'backup-host');
+    first = await connectHost(ws, hangingToken.secret, 'hanging-host', ['abort-model'], () => {
       firstJobs += 1;
       dispatchedResolve();
       // Deliberately never return a token or terminal message.
@@ -206,7 +217,7 @@ test('a client abort before first token never dispatches a failover job', async 
     }).catch((error) => error);
 
     await dispatched;
-    backup = await connectHost(ws, hostToken, 'backup-host', ['abort-model'], (message, host) => {
+    backup = await connectHost(ws, backupToken.secret, 'backup-host', ['abort-model'], (message, host) => {
       backupJobs += 1;
       host.send(JSON.stringify({ t: 'chunk', id: message.id, delta: 'should-not-run' }));
       host.send(JSON.stringify({ t: 'done', id: message.id }));

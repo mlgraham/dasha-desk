@@ -36,6 +36,12 @@ jobs:
         working-directory: ocm
         run: |
           for f in scripts/*.sh agent/*.sh; do bash -n "$f" || exit 1; done
+      - name: Agent smoke (constructs on any platform)
+        working-directory: ocm
+        run: |
+          python3 -m pip install --quiet "websockets==13.1" pyflakes
+          python3 -m pyflakes agent/agent.py
+          python3 tests/agent-smoke.py
       - name: Nothing published should carry a secret
         working-directory: ocm
         run: node --test tests/no-secrets.test.mjs

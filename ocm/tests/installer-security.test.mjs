@@ -132,8 +132,10 @@ test('rendered provider guide, README and install comments reject copy-paste tok
     'the rendered provider guide must not document OCM_HOST_TOKEN="ocm_host_…" as a command');
   assert.doesNotMatch(verifyM4, COPY_PASTE_TOKEN_ARGV,
     'verify-m4.sh must not document OCM_HOST_TOKEN=ocm_host_… as a command');
-  assert.match(guide, /read -rsp/);
-  assert.match(guide, /--preserve-env=OCM_HOST_TOKEN/);
+  assert.match(guide, /sudo OCM_AGENT_ID="my-mac" sh install.sh/,
+    'the human install path is one line with no token on it');
+  assert.match(guide, /typing hidden/,
+    'the guide must say the installer prompts for the token without echo');
   assert.match(verifyM4, /OCM_HOST_TOKEN_FILE/,
     'M4 verification must offer a secret-file path');
   assert.match(verifyM4, /read -rsp "Provider token: " OCM_HOST_TOKEN/,

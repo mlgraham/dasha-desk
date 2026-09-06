@@ -28,7 +28,8 @@ async function makeProvider(gateway, email) {
 
 function connectProvider(wsBase, token, agent) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${wsBase}/host/connect?token=${encodeURIComponent(token)}`);
+    const socket = new WebSocket(`${wsBase}/host/connect`,
+      { headers: { authorization: `Bearer ${token}` } });
     let welcomed = false;
     socket.addEventListener('error', reject);
     socket.addEventListener('open', () => socket.send(JSON.stringify({ t: 'hello', agent })));
@@ -47,7 +48,8 @@ function connectProvider(wsBase, token, agent) {
 
 function rejectedProvider(wsBase, token, firstMessage) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${wsBase}/host/connect?token=${encodeURIComponent(token)}`);
+    const socket = new WebSocket(`${wsBase}/host/connect`,
+      { headers: { authorization: `Bearer ${token}` } });
     socket.addEventListener('error', reject);
     socket.addEventListener('open', () => socket.send(JSON.stringify(firstMessage)));
     socket.addEventListener('message', (event) => {

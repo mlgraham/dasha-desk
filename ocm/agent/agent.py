@@ -306,18 +306,31 @@ async def run_job(ws, job, jobs):
     jobs.pop(job_id, None)
 
 
-async def session():
-    models = RUNTIME.models()
-    if not models:
-        raise RuntimeError("runtime reports no models")
-    url = f"{GATEWAY_URL.rstrip('/')}/host/connect"
-    async with connect(
+def _connect(url):
+    """Open the host socket with the token as an Authorization header.
+
+    The token goes in a header, never the URL. A query string is recorded verbatim
+    by every proxy and load balancer in the path, so a query-string token wrote a live
+    provider credential into ALB access logs on every reconnect.
+
+    `websockets` is pinned to 13.1, where the legacy client takes `extra_headers`
+    (14.0 renamed it). Keep the pin and this call in step.
+    """
+    return connect(
         url,
         extra_headers={"Authorization": f"Bearer {HOST_TOKEN}"},
         ping_interval=20,
         ping_timeout=20,
         max_size=8 * 1024 * 1024,
-    ) as ws:
+    )
+
+
+async def session():
+    models = RUNTIME.models()
+    if not models:
+        raise RuntimeError("runtime reports no models")
+    url = f"{GATEWAY_URL.rstrip('/')}/host/connect"
+    async with _connect(url) as ws:
         await ws.send(json.dumps({"t": "hello", "agent": capabilities(models)}))
         jobs: dict[str, asyncio.Event] = {}
         async for raw in ws:
