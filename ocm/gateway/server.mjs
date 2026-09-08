@@ -1019,13 +1019,20 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
       // at all. Log the token's SHAPE — never the token — which is enough to tell
       // the common mistakes apart: a developer key used as a host token, an empty
       // OCM_HOST_TOKEN, or a real ocm_host token that is revoked or unknown.
+      // A revoked token is named by its label and the machine it was bound to, so an
+      // agent still running on a rotated-out credential can be found without guessing
+      // from an IP. "Unknown" means never issued here. The token itself is never logged.
+      const revoked = /^ocm_host_/.test(presented) && typeof accounts.describeRevoked === 'function'
+        ? await accounts.describeRevoked(presented) : null;
       const shape = !presented ? 'absent'
-        : /^ocm_host_/.test(presented) ? 'ocm_host (unknown or revoked)'
+        : /^ocm_host_/.test(presented) ? (revoked ? 'ocm_host (revoked)' : 'ocm_host (unknown)')
         : /^ocm_live_/.test(presented) ? 'ocm_live — a developer key, not a provider token'
         : 'unrecognised prefix';
       console.error(JSON.stringify({ level: 'warn', msg: 'provider socket rejected',
         token: shape, ua: req.headers['user-agent'] || null,
-        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || null }));
+        ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || null,
+        ...(revoked ? { revoked_label: revoked.label || null, revoked_bound_to: revoked.bound_agent_id || null,
+                        revoked_at: revoked.revoked_at, accountId: revoked.account_id } : {}) }));
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;

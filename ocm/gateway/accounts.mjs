@@ -374,6 +374,19 @@ export class PgAccounts {
       `UPDATE accounts SET email_verified_at = COALESCE(email_verified_at, now()) WHERE id = $1`, [accountId]);
   }
 
+  /**
+   * Which revoked provider token is this? For the rejection log only: a machine still
+   * presenting a rotated-out token is invisible otherwise, and the label plus the
+   * machine it was bound to is enough to name it without ever logging the token.
+   */
+  async describeRevoked(secret) {
+    if (!secret) return null;
+    const { rows } = await this.pool.query(
+      `SELECT label, bound_agent_id, revoked_at, account_id FROM credentials
+        WHERE hash = $1 AND kind = 'provider_token' AND revoked_at IS NOT NULL`, [hashSecret(secret)]);
+    return rows[0] || null;
+  }
+
   /** The machine holding this credential connected. First time is kept; last time moves. */
   async markConnected(credentialId) {
     if (!credentialId) return;
@@ -585,6 +598,17 @@ export class MemoryAccounts {
   async markEmailVerified(accountId) {
     const a = this.accounts.get(accountId);
     if (a && !a.email_verified_at) a.email_verified_at = new Date();
+  }
+
+  async describeRevoked(secret) {
+    if (!secret) return null;
+    const h = hashSecret(secret);
+    for (const c of this.creds.values()) {
+      if (c.kind === 'provider_token' && c.revoked_at && sameSecret(c.hash, h)) {
+        return { label: c.label, bound_agent_id: c.bound_agent_id || null, revoked_at: c.revoked_at, account_id: c.account_id };
+      }
+    }
+    return null;
   }
 
   async markConnected(credentialId) {
