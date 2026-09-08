@@ -16,9 +16,10 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { accept } from './ws.mjs';
 import { Ledger } from './ledger.mjs';
-import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderEnrollment, renderStatus } from './console.mjs';
+import { createMailer, recoveryMessage, maskEmail } from './mail.mjs';
+import { stats, renderLanding, renderDashboard, renderNetwork, renderProviderGuide, renderSecret, renderRecoverForm, renderRecoverConfirm, renderRecoverInvalid, renderEnrollment, renderStatus } from './console.mjs';
 import { issueSession, readSession, cookieHeader, clearCookieHeader, readCookie, parseForm } from './session.mjs';
-import { AccountExistsError, MemoryAccounts } from './accounts.mjs';
+import { AccountExistsError, MemoryAccounts, normalizeEmail } from './accounts.mjs';
 import { normalizeProviderAgent } from './provider.mjs';
 
 const HEARTBEAT_MS = 30_000;
@@ -283,7 +284,14 @@ export async function createGateway({
   keys = null,
   ledgerPath = 'ocm/.data/usage.jsonl',
   grantTokens = Number(process.env.OCM_GRANT_TOKENS || 1_000_000),
+  // Account recovery by email ships dark: the form, the link and the routes exist only
+  // when this is on. Off until Amazon grants production sending, because in the SES
+  // sandbox an unverified address silently receives nothing.
+  recoveryEnabled = process.env.OCM_RECOVERY_ENABLED === '1',
+  // Tests inject a stub; production builds the SES client on first send.
+  mailer = null,
 } = {}) {
+  const mail = mailer || (recoveryEnabled ? createMailer() : null);
   const registry = new Registry(parseAliases(modelAliases));
   const admins = new Set(String(adminEmails).split(',').map((e) => e.trim().toLowerCase()).filter(Boolean));
   const isAdmin = (account) => !!account && admins.has(account.email.toLowerCase());
@@ -353,7 +361,7 @@ export async function createGateway({
                 inviteRequired: !!inviteCode,
                 notice: url.searchParams.get('notice'),
                 error: url.searchParams.get('error') }))
-            : html(res, 200, renderLanding({ inviteRequired: !!inviteCode,
+            : html(res, 200, renderLanding({ inviteRequired: !!inviteCode, recoveryEnabled,
                 error: url.searchParams.get('error') }));
         }
 
@@ -449,6 +457,59 @@ ${granted
 <div class="note"><strong>Want to contribute a Mac instead?</strong> Running a provider
 needs no invite code: your machine earns credits as it serves. See
 <a href="/provider">Run a provider</a>.</div>`,
+          }));
+        }
+
+        // ---- account recovery by email ---------------------------------------
+        // The request form always answers the same way, so it is not an oracle for
+        // which addresses have accounts. The emailed link opens a page that only mints
+        // a key on an explicit POST; the token is single-use and expires.
+        if (consolePath === '/recover' || consolePath === '/recover/confirm') {
+          if (!recoveryEnabled) return apiError(res, 404, 'account recovery is not enabled on this deployment');
+        }
+        if (req.method === 'GET' && consolePath === '/recover') {
+          return html(res, 200, renderRecoverForm({ sent: url.searchParams.get('sent') === '1' }));
+        }
+        if (req.method === 'POST' && consolePath === '/recover') {
+          const f = parseForm(await readBody(req));
+          let email = null;
+          try { email = normalizeEmail(f.email); } catch { email = null; }
+          const acct = email ? await accounts.accountByEmail(email) : null;
+          // Cap outstanding links per account: a stranger typing an address in a loop
+          // must not be able to fill someone's inbox.
+          if (acct && mail && (await accounts.openRecoveries(acct.id)) < 3) {
+            const rec = await accounts.issueRecovery(acct.id);
+            const link = `https://${consoleHost}/recover/confirm?t=${rec.token}`;
+            mail.send({ to: acct.email, ...recoveryMessage({ link, consoleHost }) })
+              .catch((e) => console.error(JSON.stringify({ level: 'error', msg: 'recovery mail failed',
+                accountId: acct.id, error: e.message })));
+          }
+          return redirect(res, '/recover?sent=1');
+        }
+        if (req.method === 'GET' && consolePath === '/recover/confirm') {
+          const t = url.searchParams.get('t') || '';
+          const live = /^ocm_recover_[-A-Za-z0-9_]{16,}$/.test(t) ? await accounts.peekRecovery(t) : null;
+          if (!live) return html(res, 400, renderRecoverInvalid());
+          const acct = await accounts.accountFor(live.accountId);
+          return html(res, 200, renderRecoverConfirm({ token: t, emailMasked: maskEmail(acct ? acct.email : '') }));
+        }
+        if (req.method === 'POST' && consolePath === '/recover/confirm') {
+          const f = parseForm(await readBody(req));
+          const t = f.t || '';
+          const used = /^ocm_recover_[-A-Za-z0-9_]{16,}$/.test(t) ? await accounts.redeemRecovery(t) : null;
+          if (!used) return html(res, 400, renderRecoverInvalid());
+          const cred = await accounts.issue(used.accountId, 'developer_key',
+            `recovered ${new Date().toISOString().slice(0, 10)}`);
+          await accounts.recordRecoveryCredential(used.recoveryId, cred.id);
+          await accounts.markEmailVerified(used.accountId);
+          console.error(JSON.stringify({ level: 'info', msg: 'account recovered', accountId: used.accountId }));
+          res.setHeader('set-cookie',
+            cookieHeader(issueSession(sessionSecret, used.accountId, cred.id), { secure: secureCookies }));
+          return html(res, 200, renderSecret({
+            title: 'Your new developer key',
+            secret: cred.secret,
+            whatNext: `<p>Your existing keys are unchanged; revoke any you no longer hold from the console.
+You are signed in with this one.</p>`,
           }));
         }
 

@@ -12,6 +12,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "@aws-sdk/client-sesv2": "^3.700.0"
   }
 }

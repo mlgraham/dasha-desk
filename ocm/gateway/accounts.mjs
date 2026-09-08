@@ -25,6 +25,11 @@ export const mintProviderToken = () => mint('ocm_host');
 // works once, which is the whole point of handing people this instead of a token.
 export const mintEnrollmentCode = () => mint('ocm_enroll');
 export const ENROLLMENT_TTL_MS = 15 * 60 * 1000;
+// Recovery tokens ride in an emailed link. Single use, half an hour, and the page the
+// link opens only mints a key on an explicit confirm, so a scanner that follows links
+// consumes nothing.
+export const mintRecoveryToken = () => mint('ocm_recover');
+export const RECOVERY_TTL_MS = 30 * 60 * 1000;
 
 /**
  * Email is a label and future notification route, not an authenticator. Until OCM
@@ -99,6 +104,20 @@ CREATE TABLE IF NOT EXISTS enrollment_codes (
   credential_id text
 );
 CREATE INDEX IF NOT EXISTS enrollment_codes_account_idx ON enrollment_codes (account_id);
+
+-- Account recovery by email. A used link proves the mailbox, which is the first time
+-- an address on this system is verified rather than merely claimed.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified_at timestamptz;
+CREATE TABLE IF NOT EXISTS recovery_tokens (
+  id            text PRIMARY KEY,
+  account_id    text NOT NULL REFERENCES accounts(id),
+  hash          text NOT NULL UNIQUE,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz NOT NULL,
+  used_at       timestamptz,
+  credential_id text
+);
+CREATE INDEX IF NOT EXISTS recovery_tokens_account_idx ON recovery_tokens (account_id);
 `;
 
 /**
@@ -268,7 +287,7 @@ export class PgAccounts {
   }
 
   async accountFor(accountId) {
-    const { rows } = await this.pool.query(`SELECT id, email FROM accounts WHERE id = $1`, [accountId]);
+    const { rows } = await this.pool.query(`SELECT id, email, email_verified_at FROM accounts WHERE id = $1`, [accountId]);
     return rows[0] || null;
   }
 
@@ -305,6 +324,54 @@ export class PgAccounts {
       `UPDATE credentials SET bound_agent_id = NULL
         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL`, [credentialId, accountId]);
     return rowCount > 0;
+  }
+
+  /** Mint a single-use recovery token for this account. Plaintext returned once. */
+  async issueRecovery(accountId, ttlMs = RECOVERY_TTL_MS) {
+    const token = mintRecoveryToken();
+    const id = `rec_${randomBytes(9).toString('base64url')}`;
+    const expiresAt = new Date(Date.now() + ttlMs);
+    await this.pool.query(
+      `INSERT INTO recovery_tokens (id, account_id, hash, expires_at) VALUES ($1,$2,$3,$4)`,
+      [id, accountId, hashSecret(token), expiresAt]);
+    return { id, token, expires_at: expiresAt };
+  }
+
+  /** Unused, unexpired recovery tokens for this account: the cap against mail-bombing. */
+  async openRecoveries(accountId) {
+    const { rows } = await this.pool.query(
+      `SELECT COUNT(*)::int AS n FROM recovery_tokens
+        WHERE account_id = $1 AND used_at IS NULL AND expires_at > now()`, [accountId]);
+    return rows[0].n;
+  }
+
+  /** Is this token live? Read-only, for the confirm page. Never consumes. */
+  async peekRecovery(token) {
+    if (!token) return null;
+    const { rows } = await this.pool.query(
+      `SELECT id, account_id FROM recovery_tokens
+        WHERE hash = $1 AND used_at IS NULL AND expires_at > now()`, [hashSecret(token)]);
+    return rows[0] ? { recoveryId: rows[0].id, accountId: rows[0].account_id } : null;
+  }
+
+  /** Consume the token: conditional update, so two racing confirms cannot both win. */
+  async redeemRecovery(token) {
+    if (!token) return null;
+    const { rows } = await this.pool.query(
+      `UPDATE recovery_tokens SET used_at = now()
+        WHERE hash = $1 AND used_at IS NULL AND expires_at > now()
+      RETURNING id, account_id`, [hashSecret(token)]);
+    return rows[0] ? { recoveryId: rows[0].id, accountId: rows[0].account_id } : null;
+  }
+
+  async recordRecoveryCredential(recoveryId, credentialId) {
+    await this.pool.query(`UPDATE recovery_tokens SET credential_id = $2 WHERE id = $1`, [recoveryId, credentialId]);
+  }
+
+  /** A used recovery link proves the mailbox. Kept once, never cleared. */
+  async markEmailVerified(accountId) {
+    await this.pool.query(
+      `UPDATE accounts SET email_verified_at = COALESCE(email_verified_at, now()) WHERE id = $1`, [accountId]);
   }
 
   /** The machine holding this credential connected. First time is kept; last time moves. */
@@ -349,7 +416,7 @@ export class PgAccounts {
 
 /** In-memory equivalent, so the test suite needs no database. */
 export class MemoryAccounts {
-  constructor() { this.accounts = new Map(); this.creds = new Map(); this.enrollments = new Map(); }
+  constructor() { this.accounts = new Map(); this.creds = new Map(); this.enrollments = new Map(); this.recoveries = new Map(); }
   async init() { return this; }
 
   async createAccount(email) {
@@ -472,6 +539,52 @@ export class MemoryAccounts {
     const lower = String(email || '').toLowerCase();
     for (const a of this.accounts.values()) if (a.email === lower) return a;
     return null;
+  }
+
+  async issueRecovery(accountId, ttlMs = RECOVERY_TTL_MS) {
+    const token = mintRecoveryToken();
+    const id = `rec_${randomBytes(9).toString('base64url')}`;
+    const expires_at = new Date(Date.now() + ttlMs);
+    this.recoveries.set(id, { id, account_id: accountId, hash: hashSecret(token), created_at: new Date(),
+                              expires_at, used_at: null, credential_id: null });
+    return { id, token, expires_at };
+  }
+
+  async openRecoveries(accountId) {
+    const now = new Date();
+    return [...this.recoveries.values()]
+      .filter((r) => r.account_id === accountId && !r.used_at && r.expires_at > now).length;
+  }
+
+  #liveRecovery(token) {
+    if (!token) return null;
+    const h = hashSecret(token);
+    for (const r of this.recoveries.values()) {
+      if (sameSecret(r.hash, h)) return (!r.used_at && r.expires_at > new Date()) ? r : null;
+    }
+    return null;
+  }
+
+  async peekRecovery(token) {
+    const r = this.#liveRecovery(token);
+    return r ? { recoveryId: r.id, accountId: r.account_id } : null;
+  }
+
+  async redeemRecovery(token) {
+    const r = this.#liveRecovery(token);
+    if (!r) return null;
+    r.used_at = new Date();
+    return { recoveryId: r.id, accountId: r.account_id };
+  }
+
+  async recordRecoveryCredential(recoveryId, credentialId) {
+    const r = this.recoveries.get(recoveryId);
+    if (r) r.credential_id = credentialId;
+  }
+
+  async markEmailVerified(accountId) {
+    const a = this.accounts.get(accountId);
+    if (a && !a.email_verified_at) a.email_verified_at = new Date();
   }
 
   async markConnected(credentialId) {

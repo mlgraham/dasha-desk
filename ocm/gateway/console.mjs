@@ -217,7 +217,44 @@ needs a long-lived credential can still use <strong>New provider token</strong>.
 <p><a href="/">Back to the console</a></p>`);
 }
 
-export function renderLanding({ inviteRequired, error }) {
+/** Ask for the address. The answer page is identical whether or not an account exists. */
+export function renderRecoverForm({ sent = false } = {}) {
+  return page('Recover your account', `<h1>Recover your account</h1>
+${sent ? `<div class="note"><strong>If that address has an account, a recovery link is on its way.</strong>
+It works once and expires in 30 minutes. Nothing changes until you use it. If nothing arrives,
+check the address and try again, or ask whoever gave you the invite.</div>`
+: `<p class="sub">Accounts are identified by a developer key that is shown once. If you have lost
+yours, we email a link to the address the account was created with. The link issues a new
+key; your existing keys are not changed.</p>
+<form method="post" action="/recover" class="card" style="max-width:420px">
+  <label for="e">Email</label>
+  <input id="e" type="email" name="email" placeholder="you@example.com" autocomplete="email" required>
+  <button type="submit">Send recovery link</button>
+</form>`}
+<p style="margin-top:14px"><a href="/">Back to the console</a></p>`);
+}
+
+/** The link's landing page: shows a masked address and asks for one explicit click. */
+export function renderRecoverConfirm({ token, emailMasked }) {
+  return page('Confirm recovery', `<h1>Issue a new developer key?</h1>
+<p class="sub">This link was sent to <strong>${esc(emailMasked)}</strong>. Confirming issues a new
+developer key for that account and signs you in. Existing keys stay valid; revoke any you no
+longer hold from the console afterwards.</p>
+<form method="post" action="/recover/confirm" class="card" style="max-width:420px">
+  <input type="hidden" name="t" value="${esc(token)}">
+  <button type="submit">Issue a new key and sign in</button>
+</form>
+<p class="muted" style="margin-top:10px">Not you? Close this page. The link works once and expires
+in 30 minutes; nothing has changed.</p>`);
+}
+
+export function renderRecoverInvalid() {
+  return page('Recovery link not valid', `<h1>That link is not valid</h1>
+<p class="sub">It may have been used already, or it has expired. Links work once and last 30
+minutes. <a href="/recover">Request a new one</a>, or <a href="/">back to the console</a>.</p>`);
+}
+
+export function renderLanding({ inviteRequired, error, recoveryEnabled = false }) {
   return page('OCM console', `<h1>Open-Compute Marketplace</h1>
 <p class="sub">Alpha.</p>
 ${error ? `<div class="note warn">${esc(error)}</div>` : ''}
@@ -229,6 +266,7 @@ ${error ? `<div class="note warn">${esc(error)}</div>` : ''}
       <input id="k" type="password" name="key" placeholder="ocm_live_…" autocomplete="off" required>
       <button type="submit">Sign in</button>
     </form>
+    ${recoveryEnabled ? '<p class="muted" style="margin-top:10px">Lost your key? <a href="/recover">Recover by email</a>.</p>' : ''}
   </div>
   <div class="card"><h3>Create an account</h3>
     <p class="muted">Anyone can sign up. An invite code is what gives you tokens.</p>
