@@ -78,6 +78,11 @@ CREATE INDEX IF NOT EXISTS credentials_account_idx ON credentials (account_id);
 -- cannot be used from somewhere else and per-machine revocation means what an
 -- operator assumes it means. Added later, hence the ALTER for existing databases.
 ALTER TABLE credentials ADD COLUMN IF NOT EXISTS bound_agent_id text;
+-- Onboarding funnel: when the machine holding this credential first connected, and
+-- when it was last seen. Together with enrollment_codes (issued, used) and usage_log
+-- (first job) this says where a new provider stopped.
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS first_connected_at timestamptz;
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS last_connected_at  timestamptz;
 
 -- Enrollment codes: what a person pastes instead of a provider token. Stored hashed
 -- like every other secret; used once; expire. The credential a code produced is
@@ -95,6 +100,30 @@ CREATE TABLE IF NOT EXISTS enrollment_codes (
 );
 CREATE INDEX IF NOT EXISTS enrollment_codes_account_idx ON enrollment_codes (account_id);
 `;
+
+/**
+ * One funnel row per provider machine: issued -> enrolled -> connected -> (first job
+ * comes from the ledger). Pending codes are rows too, so a code that was never used
+ * is visible as the place onboarding stopped.
+ */
+export function shapeFunnel(credRows, pendingRows) {
+  const creds = credRows.map((c) => ({
+    credential_id: c.id, account_id: c.account_id, label: c.label || null,
+    agent_id: c.bound_agent_id || null,
+    issued_at: c.code_issued_at || c.created_at,
+    enrolled_at: c.enrolled_at || null,
+    first_connected_at: c.first_connected_at || null,
+    last_connected_at: c.last_connected_at || null,
+    revoked_at: c.revoked_at || null,
+    pending: false,
+  }));
+  const pending = pendingRows.map((e) => ({
+    credential_id: null, account_id: e.account_id, label: e.label || null, agent_id: null,
+    issued_at: e.created_at, expires_at: e.expires_at, enrolled_at: null,
+    first_connected_at: null, last_connected_at: null, revoked_at: null, pending: true,
+  }));
+  return [...pending, ...creds];
+}
 
 /**
  * Postgres-backed store. The in-memory variant below keeps tests dependency-free.
@@ -278,6 +307,33 @@ export class PgAccounts {
     return rowCount > 0;
   }
 
+  /** The machine holding this credential connected. First time is kept; last time moves. */
+  async markConnected(credentialId) {
+    if (!credentialId) return;
+    await this.pool.query(
+      `UPDATE credentials SET first_connected_at = COALESCE(first_connected_at, now()),
+                              last_connected_at = now()
+        WHERE id = $1`, [credentialId]);
+  }
+
+  /** Funnel rows for one account, or every account when accountId is null (admin). */
+  async funnel(accountId = null) {
+    const params = accountId ? [accountId] : [];
+    const scope = accountId ? 'AND c.account_id = $1' : '';
+    const creds = await this.pool.query(
+      `SELECT c.id, c.account_id, c.label, c.bound_agent_id, c.created_at, c.revoked_at,
+              c.first_connected_at, c.last_connected_at,
+              e.created_at AS code_issued_at, e.used_at AS enrolled_at
+         FROM credentials c LEFT JOIN enrollment_codes e ON e.credential_id = c.id
+        WHERE c.kind = 'provider_token' ${scope}
+        ORDER BY c.created_at DESC`, params);
+    const pending = await this.pool.query(
+      `SELECT id, account_id, label, created_at, expires_at FROM enrollment_codes
+        WHERE used_at IS NULL AND expires_at > now() ${accountId ? 'AND account_id = $1' : ''}
+        ORDER BY created_at DESC`, params);
+    return shapeFunnel(creds.rows, pending.rows);
+  }
+
   /** Every account, oldest first — for the admin network view only. */
   async listAccounts() {
     const { rows } = await this.pool.query(
@@ -416,6 +472,31 @@ export class MemoryAccounts {
     const lower = String(email || '').toLowerCase();
     for (const a of this.accounts.values()) if (a.email === lower) return a;
     return null;
+  }
+
+  async markConnected(credentialId) {
+    const c = this.creds.get(credentialId);
+    if (!c) return;
+    const now = new Date();
+    c.first_connected_at = c.first_connected_at || now;
+    c.last_connected_at = now;
+  }
+
+  async funnel(accountId = null) {
+    const byCred = new Map();
+    for (const e of this.enrollments.values()) if (e.credential_id) byCred.set(e.credential_id, e);
+    const creds = [...this.creds.values()]
+      .filter((c) => c.kind === 'provider_token' && (!accountId || c.account_id === accountId))
+      .sort((a, b) => b.created_at - a.created_at)
+      .map((c) => {
+        const e = byCred.get(c.id);
+        return { ...c, code_issued_at: e ? e.created_at : null, enrolled_at: e ? e.used_at : null };
+      });
+    const now = new Date();
+    const pending = [...this.enrollments.values()]
+      .filter((e) => !e.used_at && e.expires_at > now && (!accountId || e.account_id === accountId))
+      .sort((a, b) => b.created_at - a.created_at);
+    return shapeFunnel(creds, pending);
   }
 
   async listAccounts() {

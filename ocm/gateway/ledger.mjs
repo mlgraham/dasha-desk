@@ -191,6 +191,17 @@ export class Ledger {
    * as "served today". Grants are excluded, and nothing per-consumer is returned, so
    * the result can be published as-is.
    */
+  /** Earliest usage row per host: the moment a machine first served a real job. */
+  async firstServedByHost() {
+    this.#requireHealthy();
+    const first = {};
+    for (const e of this.entries) {
+      if (e.kind !== 'usage' || !e.host) continue;
+      if (!first[e.host] || e.at < first[e.host]) first[e.host] = e.at;
+    }
+    return first;
+  }
+
   async servedToday(now = new Date()) {
     this.#requireHealthy();
     const since = startOfUtcDay(now);

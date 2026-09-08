@@ -264,6 +264,16 @@ export class PgLedger {
   }
 
   /** Same shape as Ledger#servedToday: usage rows since midnight UTC, no consumer ids. */
+  /** Earliest usage row per host: the moment a machine first served a real job. */
+  async firstServedByHost() {
+    const { rows } = await this.#query(
+      `SELECT host, MIN(at) AS first FROM usage_log
+        WHERE kind='usage' AND host IS NOT NULL GROUP BY host`);
+    const first = {};
+    for (const r of rows) first[r.host] = new Date(r.first).toISOString();
+    return first;
+  }
+
   async servedToday(now = new Date()) {
     const since = startOfUtcDay(now);
     const { rows } = await this.#query(

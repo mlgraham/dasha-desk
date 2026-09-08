@@ -1020,6 +1020,12 @@ export OPENAI_API_KEY="${cred.secret}"</pre>`,
               return;
             }
             hostId = agent.id;
+            // Onboarding funnel: the first connect of this credential's machine is the
+            // "connected" step. Recorded once, never overwritten; last-seen moves.
+            if (typeof accounts.markConnected === 'function') {
+              Promise.resolve(accounts.markConnected(credentialId))
+                .catch((e) => console.error('markConnected', e));
+            }
             conn.sendJson({ t: 'welcome', host_id: hostId, heartbeat_ms: HEARTBEAT_MS });
           })
           .catch((e) => { console.error('claimAgent', e); conn.close(1011, 'internal'); });

@@ -20,6 +20,44 @@ const dur = (s) => {
 
 const num = (n) => n.toLocaleString('en-US');
 
+/** Relative time for funnel columns: a person reads "3h ago" faster than a timestamp. */
+const ago = (d) => {
+  if (!d) return '—';
+  const s = Math.max(0, Math.round((Date.now() - new Date(d)) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
+
+/**
+ * One table, four steps: code issued, enrolled, first connected, first job. Shared by
+ * the owner's dashboard and the admin network view (which adds the owner column).
+ */
+function funnelTable(rows, { live, firstServed, credited, owner = null }) {
+  if (!rows.length) return '';
+  const body = rows.map((r) => {
+    const h = r.agent_id ? live.get(r.agent_id) : null;
+    const now = r.pending ? '<span class="muted">waiting for the installer</span>'
+      : h ? (h.inflight ? 'Serving' : h.warm ? 'Ready' : 'Online, cold')
+      : r.first_connected_at ? `<span class="muted">offline, seen ${esc(ago(r.last_connected_at))}</span>`
+      : '<span class="muted">never connected</span>';
+    const name = r.agent_id ? `<code>${esc(r.agent_id)}</code>`
+      : `${esc(r.label || 'unnamed')} <span class="muted">(${r.pending ? 'code outstanding' : 'unclaimed token'})</span>`;
+    return `<tr>${owner ? `<td>${owner(r.account_id)}</td>` : ''}
+    <td>${name}</td>
+    <td>${esc(ago(r.issued_at))}</td>
+    <td>${r.enrolled_at ? esc(ago(r.enrolled_at)) : (r.pending ? '—' : '<span class="muted">token, not code</span>')}</td>
+    <td>${esc(ago(r.first_connected_at))}</td>
+    <td>${esc(ago(r.agent_id ? firstServed[r.agent_id] : null))}</td>
+    <td>${now}</td>
+    <td>${num(r.agent_id ? (credited[r.agent_id] || 0) : 0)}</td></tr>`;
+  }).join('');
+  return `<table class="data">
+<thead><tr>${owner ? '<th>Owner</th>' : ''}<th>Machine</th><th>Code issued</th><th>Enrolled</th><th>First connected</th><th>First job</th><th>Now</th><th>Credited</th></tr></thead>
+<tbody>${body}</tbody></table>`;
+}
+
 export async function stats(registry, ledger) {
   const led = await ledger.summary();
   const hosts = registry.online().map((h) => ({
@@ -215,6 +253,12 @@ export async function renderDashboard({ registry, ledger, accounts, account, api
   const creds = await accounts.listCredentials(account.id);
   const pending = typeof accounts.listEnrollments === 'function' ? await accounts.listEnrollments(account.id) : [];
   const myHosts = s.hosts.filter((h) => h.accountId === account.id);
+  const funnel = typeof accounts.funnel === 'function'
+    ? (await accounts.funnel(account.id)).filter((r) => !r.revoked_at) : [];
+  const firstServed = typeof ledger.firstServedByHost === 'function' ? await ledger.firstServedByHost() : {};
+  const led = await ledger.summary();
+  const live = new Map(s.hosts.map((h) => [h.id, h]));
+  const funnelHtml = funnelTable(funnel, { live, firstServed, credited: led.creditedByHost });
 
   const credRows = creds.length ? creds.map((c) => `<tr>
     <td>${c.kind === 'developer_key' ? 'Developer key' : 'Provider token'}</td>
@@ -264,10 +308,12 @@ ${redeemBlock}
 </div>
 
 <h2>Your providers</h2>
-<div class="tablewrap">${hostRows ? `<table class="data">
+<div class="tablewrap">${funnelHtml || (hostRows ? `<table class="data">
 <thead><tr><th>Host</th><th>Chip</th><th>Memory</th><th>Uptime</th><th>Tokens credited</th></tr></thead>
 <tbody>${hostRows}</tbody></table>`
-  : '<div class="empty">None connected. <a href="/provider">Run a provider</a> to contribute a Mac.</div>'}</div>
+  : '<div class="empty">None yet. <a href="/provider">Run a provider</a> to contribute a Mac.</div>')}</div>
+${funnelHtml ? `<p class="muted" style="margin-top:8px">Each machine's path: code issued, enrolled, first connected, first job served.
+A row that stops early is where that machine's setup stopped.</p>` : ''}
 
 <h2>Credentials</h2>
 <div class="tablewrap">${credRows ? `<table class="data">
@@ -377,6 +423,13 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
   const all = await accounts.listAccounts();
   const emailOf = new Map(all.map((a) => [a.id, a.email]));
   const who = (id) => id ? esc(emailOf.get(id) || id) : '—';
+  const funnelRows = typeof accounts.funnel === 'function'
+    ? (await accounts.funnel()).filter((r) => !r.revoked_at) : [];
+  const firstServed = typeof ledger.firstServedByHost === 'function' ? await ledger.firstServedByHost() : {};
+  const led = await ledger.summary();
+  const funnelAll = funnelTable(funnelRows, {
+    live: new Map(s.hosts.map((h) => [h.id, h])), firstServed, credited: led.creditedByHost, owner: who,
+  });
   const day = (d) => d ? new Date(d).toISOString().slice(0, 10) : 'never';
 
   const hostRows = s.hosts.map((h) => `<tr>
@@ -416,6 +469,11 @@ export async function renderNetwork({ registry, ledger, accounts, account }) {
 <div class="tablewrap">${hostRows ? `<table class="data">
 <thead><tr><th>Host</th><th>Owner</th><th>State</th><th>Chip</th><th>Memory</th><th>Models</th><th>In flight</th><th>Uptime</th><th>Credited</th></tr></thead>
 <tbody>${hostRows}</tbody></table>` : '<div class="empty">No providers connected.</div>'}</div>
+
+<h2>Onboarding funnel</h2>
+<div class="tablewrap">${funnelAll || '<div class="empty">No provider machines yet.</div>'}</div>
+<p class="muted" style="margin-top:8px">Every provider machine across every account, with where its setup got to.
+Revoked tokens are omitted; a rotated machine shows its current token only.</p>
 
 <h2>Accounts</h2>
 <div class="tablewrap">${acctRows ? `<table class="data">
